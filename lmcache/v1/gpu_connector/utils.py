@@ -515,7 +515,8 @@ def get_device(kv_caches: DiscoverableKVCache) -> torch.device:
 # Formats whose per-layer tensor dim-0 is the *block* axis AND for
 # which we currently support dim-0 padding (e.g. DeepSeek V4
 # compressor / indexer caches sharing a KV pool with larger attn
-# groups).
+# groups). This includes blocks-first fused NHD attention layouts whose
+# physical row width can be inherited from a larger KV group.
 #
 # ``NL_X_NP_X_NB_BS_ONE_HS`` (vLLM-Ascend MLA/DSA plane tuples; NP
 # means num_planes, NP = 1 latent-only, 2 MLA, 3 DSA, HS possibly
@@ -537,9 +538,8 @@ _BLOCK_AXIS_FORMATS: frozenset = frozenset(
         lmcache_native.EngineKVFormat.NL_X_NB_BS_HS,
         lmcache_native.EngineKVFormat.NL_X_NB_BSV_BSS,
         lmcache_native.EngineKVFormat.NL_X_NP_X_NB_BS_ONE_HS,
-        # Under vLLM's blocks-first layouts (BLHNC / BLNHC) these views'
-        # stride(0) spans every layer's bytes for the block; when the cache
-        # is layer-compact, stride(0) is simply the tight per-block step.
+        # Blocks-first content-size layouts inherit the physical row width
+        # from the largest KV group in a shared vLLM pool.
         lmcache_native.EngineKVFormat.NL_X_NB_NH_BS_CS,
         lmcache_native.EngineKVFormat.NL_X_NB_BS_NH_CS,
     }
@@ -621,8 +621,7 @@ def resolve_block_stride_and_log_layout(
                     "resolve_block_stride_and_log_layout: group's probe "
                     f"tensor has dim-0 padding ({padding} elements per "
                     f"block) but engine_kv_format={engine_kv_format!r} is not "
-                    "a supported dim-0-padded format (only "
-                    "NL_X_NB_BS_HS is); downstream transfer kernels "
+                    "a supported dim-0-padded format; downstream transfer kernels "
                     "cannot honour this padding and would read/write "
                     "wrong bytes. "
                     f"layer_idx={layer_idx}, shape={tuple(rep.shape)}, "

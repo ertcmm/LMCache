@@ -582,6 +582,7 @@ class QRingBufferAdapter:
             RuntimeError: if the transfer context is not established.
         """
         logger.info("Registering paged-Q ring")
+        self._adapter.ensure_transfer_context_registered()
         if not self._adapter.transfer_ctx:
             raise RuntimeError(
                 "register_q_ring() requires an established transfer context; "

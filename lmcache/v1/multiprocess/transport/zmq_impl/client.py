@@ -50,6 +50,28 @@ class ZmqMultiprocessClient(RequestClient):
             engine_group_infos,
         )
 
+    def register_kv_cache_metadata(
+        self,
+        instance_id: int,
+        tensor_metadata: list[Any],
+        model_name: str,
+        world_size: int,
+        engine_type: Any,
+        layout_hints: Any,
+        engine_group_infos: list[Any],
+    ) -> MessagingFuture[Any]:
+        """Register KV layout without importing CUDA IPC storage."""
+        return self._call(
+            RequestType.REGISTER_KV_CACHE_METADATA,
+            instance_id,
+            tensor_metadata,
+            model_name,
+            world_size,
+            engine_type,
+            layout_hints,
+            engine_group_infos,
+        )
+
     def unregister_kv_cache(self, instance_id: int) -> MessagingFuture[Any]:
         """Unregister a worker KV cache."""
         return self._call(RequestType.UNREGISTER_KV_CACHE, instance_id)

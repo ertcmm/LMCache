@@ -19,6 +19,7 @@ from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
     KVCache,
+    KVTensorMetadata,
     PrepareRetrieveResponse,
     PrepareStoreResponse,
     RegisterEngineDrivenContextPayload,
@@ -30,6 +31,7 @@ from lmcache.v1.multiprocess.protocols.base import HandlerType, ProtocolDefiniti
 # Define request names for this protocol group
 REQUEST_NAMES = [
     "REGISTER_KV_CACHE",
+    "REGISTER_KV_CACHE_METADATA",
     "UNREGISTER_KV_CACHE",
     "REGISTER_Q_CACHE",
     "UNREGISTER_Q_CACHE",
@@ -78,6 +80,20 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
             payload_classes=[
                 int,
                 KVCache,
+                str,
+                int,
+                EngineType,
+                LayoutHints,
+                list[EngineGroupInfo],
+            ],
+            response_class=None,
+            handler_type=HandlerType.SYNC,
+        ),
+        # Register KV-cache layout without importing CUDA IPC storage.
+        "REGISTER_KV_CACHE_METADATA": ProtocolDefinition(
+            payload_classes=[
+                int,
+                list[KVTensorMetadata],
                 str,
                 int,
                 EngineType,

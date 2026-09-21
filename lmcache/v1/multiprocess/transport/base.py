@@ -34,6 +34,17 @@ class RequestClient(Protocol):
         engine_group_infos: list[Any],
     ) -> MessagingFuture[Any]: ...
 
+    def register_kv_cache_metadata(
+        self,
+        instance_id: int,
+        tensor_metadata: list[Any],
+        model_name: str,
+        world_size: int,
+        engine_type: Any,
+        layout_hints: Any,
+        engine_group_infos: list[Any],
+    ) -> MessagingFuture[Any]: ...
+
     def unregister_kv_cache(self, instance_id: int) -> MessagingFuture[Any]: ...
 
     def register_q_cache(

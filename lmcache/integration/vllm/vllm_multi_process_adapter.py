@@ -35,6 +35,7 @@ from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     IPCCacheServerKey,
+    KVTensorMetadata,
 )
 from lmcache.v1.multiprocess.futures import MessagingFuture
 from lmcache.v1.multiprocess.group_view import (
@@ -43,6 +44,7 @@ from lmcache.v1.multiprocess.group_view import (
 )
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 from lmcache.v1.multiprocess.transfer_context import (
+    MPTransferMode,
     TransferContext,
     create_transfer_context,
 )
@@ -1384,6 +1386,10 @@ class LMCacheMPWorkerAdapter:
         self.engine_group_infos: list[EngineGroupInfo] = []
         # Transport context for transfer operations.
         self.transfer_ctx: TransferContext | None = None
+        # register_kv_caches() sends layout metadata for CUDA caches first;
+        # full CUDA IPC registration is promoted on the first transfer.
+        self._transfer_context_lock = threading.RLock()
+        self._metadata_registration_sent = False
 
         # Request futures
         self.store_futures: dict[str, MessagingFuture[StoreResult]] = {}
@@ -1539,23 +1545,7 @@ class LMCacheMPWorkerAdapter:
         engine_group_infos: Sequence[EngineGroupInfo] = (),
         layout_hints: "LayoutHints | None" = None,
     ) -> None:
-        """
-        Register the kv caches with LMCache server.
-
-        Args:
-            kv_caches: A dict of kv caches to register. The keys are the
-                layer names and the values are the corresponding tensors.
-            engine_group_infos: LMCache-owned engine KV cache group metadata.
-            layout_hints: Engine layout hints forwarded to the server; built
-                here from the ambient vLLM config when not provided.
-
-        Raises:
-            ConnectionError: if the server does not respond within
-                mq_timeout.
-            ValueError: if the LMCache chunk size is not a multiple of an
-                engine group's ``tokens_per_block`` (chunk boundaries would
-                not align with that group's paged-chunk boundaries).
-        """
+        """Register KV layout and defer CUDA IPC import until transfer."""
         logger.info("Registering kv caches")
         for info in engine_group_infos:
             if (
@@ -1567,13 +1557,90 @@ class LMCacheMPWorkerAdapter:
                     f"multiple of engine group {info.engine_group_id} "
                     f"tokens_per_block {info.tokens_per_block}"
                 )
-        self.kv_caches = kv_caches
-        self.engine_group_infos = list(engine_group_infos)
-        # Reused when heartbeat recovery re-registers.
-        self._layout_hints = (
-            layout_hints if layout_hints is not None else vllm_layout_hints()
+        with self._transfer_context_lock:
+            self.kv_caches = kv_caches
+            self.engine_group_infos = list(engine_group_infos)
+            self._layout_hints = (
+                layout_hints if layout_hints is not None else vllm_layout_hints()
+            )
+            if self._should_defer_kv_cache_registration(kv_caches):
+                logger.info(
+                    "Registering KV layout metadata now; deferring CUDA IPC "
+                    "registration until the first STORE/RETRIEVE request"
+                )
+                self._send_register_kv_cache_metadata_request(kv_caches)
+                return
+            self._send_register_kv_caches_request(kv_caches)
+
+    def _should_defer_kv_cache_registration(
+        self, kv_caches: dict[str, torch.Tensor]
+    ) -> bool:
+        """Return whether this registration would import CUDA IPC storage."""
+        if not kv_caches:
+            return False
+        if any(getattr(getattr(value, "device", None), "type", None) != "cuda"
+               for value in kv_caches.values()):
+            return False
+        mode = self._mp_transfer_mode
+        if mode is None:
+            mode = os.environ.get("LMCACHE_MP_TRANSFER_MODE", MPTransferMode.AUTO.value)
+        try:
+            resolved = mode if isinstance(mode, MPTransferMode) else MPTransferMode(
+                str(mode).lower()
+            )
+        except ValueError:
+            return False
+        return resolved is not MPTransferMode.ENGINE_DRIVEN
+
+    def _send_register_kv_cache_metadata_request(
+        self, kv_caches: dict[str, torch.Tensor]
+    ) -> None:
+        """Register lookup layout without exporting CUDA IPC handles."""
+        tensor_metadata = [
+            KVTensorMetadata(
+                shape=tuple(int(dim) for dim in tensor.shape),
+                stride=tuple(int(step) for step in tensor.stride()),
+                dtype=str(tensor.dtype),
+                storage_offset=int(tensor.storage_offset()),
+            )
+            for tensor in kv_caches.values()
+        ]
+        future = self.req_client.register_kv_cache_metadata(
+            self.instance_id,
+            tensor_metadata,
+            self.model_name,
+            self.world_size,
+            EngineType.VLLM,
+            self._layout_hints,
+            list(self.engine_group_infos),
         )
-        self._send_register_kv_caches_request(kv_caches)
+        try:
+            future.result(timeout=self._mq_timeout)
+        except TimeoutError:
+            raise ConnectionError(
+                "LMCache server did not respond to KV layout metadata "
+                "registration within "
+                f"{self._mq_timeout}s. Is the server running?"
+            ) from None
+        self._metadata_registration_sent = True
+
+    def ensure_transfer_context_registered(self) -> None:
+        """Ensure full registration before integrations export CUDA IPC data."""
+        self._ensure_transfer_context_registered()
+
+    def _ensure_transfer_context_registered(self) -> None:
+        """Promote deferred layout registration before a real transfer."""
+        if self.transfer_ctx is not None:
+            return
+        with self._transfer_context_lock:
+            if self.transfer_ctx is not None:
+                return
+            if not self.kv_caches:
+                raise RuntimeError(
+                    "KV caches are not initialized. "
+                    "Call register_kv_caches() before submitting requests."
+                )
+            self._send_register_kv_caches_request(self.kv_caches)
 
     def _block_ids_per_group(self, op: LoadStoreOp) -> list[list[int]]:
         return expand_engine_block_ids(self.engine_group_infos, op.block_ids)
@@ -1582,47 +1649,38 @@ class LMCacheMPWorkerAdapter:
         self,
         kv_caches: dict[str, torch.Tensor],
     ) -> None:
-        """Submit a REGISTER_KV_CACHE request and wait for the response.
-
-        Shared by the public ``register_kv_caches`` entry point and the
-        heartbeat recovery path (``_reregister_kv_caches_callback``).
-
-        Args:
-            kv_caches: The KV cache dict to register.
-
-        Raises:
-            ConnectionError: if the server does not respond within
-                mq_timeout.
-        """
-        self.kv_caches = kv_caches
-        transfer_ctx = create_transfer_context(
-            kv_caches,
-            instance_id=self.instance_id,
-            req_client=self.req_client,
-            mode=self._mp_transfer_mode,
-        )
-        layout_hints = self._layout_hints
-        self.transfer_ctx = transfer_ctx
-        try:
-            # Register on the local, not self.transfer_ctx: a concurrent
-            # shutdown() may null self.transfer_ctx between publish and this
-            # call. The local is always non-None.
-            transfer_ctx.register(
+        """Submit a full REGISTER_KV_CACHE request and wait for its ACK."""
+        with self._transfer_context_lock:
+            self.kv_caches = kv_caches
+            transfer_ctx = create_transfer_context(
                 kv_caches,
-                self.model_name,
-                self.world_size,
-                self.blocks_in_chunk,
-                self._mq_timeout,
-                layout_hints=layout_hints,
-                engine_group_infos=self.engine_group_infos,
-                engine_type=EngineType.VLLM,
+                instance_id=self.instance_id,
+                req_client=self.req_client,
+                mode=self._mp_transfer_mode,
             )
-        except TimeoutError:
-            raise ConnectionError(
-                "LMCache server did not respond to "
-                "register_kv_caches within "
-                f"{self._mq_timeout}s. Is the server running?"
-            ) from None
+            try:
+                transfer_ctx.register(
+                    kv_caches,
+                    self.model_name,
+                    self.world_size,
+                    self.blocks_in_chunk,
+                    self._mq_timeout,
+                    layout_hints=self._layout_hints,
+                    engine_group_infos=self.engine_group_infos,
+                    engine_type=EngineType.VLLM,
+                )
+            except TimeoutError:
+                transfer_ctx.close()
+                raise ConnectionError(
+                    "LMCache server did not respond to "
+                    "register_kv_caches within "
+                    f"{self._mq_timeout}s. Is the server running?"
+                ) from None
+            except BaseException:
+                transfer_ctx.close()
+                raise
+            self.transfer_ctx = transfer_ctx
+            self._metadata_registration_sent = False
 
     def _ensure_heartbeat_started(self) -> None:
         """Lazily start the heartbeat thread on first store/retrieve.
@@ -1716,14 +1774,15 @@ class LMCacheMPWorkerAdapter:
         Raises:
             RuntimeError: If called before ``register_kv_caches()``.
         """
+        if not self.is_healthy:
+            return None
+        self._ensure_transfer_context_registered()
         transfer_ctx = self.transfer_ctx
         if transfer_ctx is None:
             raise RuntimeError(
                 "KV caches are not registered. Call register_kv_caches() "
                 "before creating transfer events."
             )
-        if not self.is_healthy:
-            return None
         return transfer_ctx.create_recorded_event()
 
     @_lmcache_nvtx_annotate
@@ -1772,6 +1831,8 @@ class LMCacheMPWorkerAdapter:
                 self._completed_store_requests[request_id] = 1
                 self._failed_store_requests.add(request_id)
             return
+
+        self._ensure_transfer_context_registered()
 
         assert op.token_ids is not None
         key = self._create_key(
@@ -1834,6 +1895,8 @@ class LMCacheMPWorkerAdapter:
             self.error_block_ids.update(op.flat_block_ids)
             self._dropped_retrieves.add(request_id)
             return
+
+        self._ensure_transfer_context_registered()
 
         assert op.token_ids is not None
         key = self._create_key(
@@ -2360,21 +2423,20 @@ class LMCacheMPWorkerAdapter:
         return events
 
     def shutdown(self) -> None:
-        """
-        Shutdown the LMCache MP worker adapter.
-
-        Stops the heartbeat (if started) before UNREGISTER: no new ping
-        on the closing request client, and a straggler in-flight cycle cannot
-        re-register or flip the health event after unregistration.
-        """
+        """Stop liveness, unregister server state, and release local state."""
         with self._heartbeat_lock:
             if self._heartbeat is not None:
                 self._heartbeat.stop()
 
-        if self.transfer_ctx is not None:
+        with self._transfer_context_lock:
             logger.info("Unregistering kv caches")
             try:
-                future = self.transfer_ctx.unregister()
+                if self.transfer_ctx is not None:
+                    future = self.transfer_ctx.unregister()
+                elif self._metadata_registration_sent:
+                    future = self.req_client.unregister_kv_cache(self.instance_id)
+                else:
+                    future = None
                 if future is not None:
                     future.result(timeout=self._mq_timeout)
             except TimeoutError:
@@ -2384,16 +2446,16 @@ class LMCacheMPWorkerAdapter:
                     self._mq_timeout,
                 )
 
-        if self.dispatcher is not None:
-            dispatch(self.dispatcher, "shutdown")
+            if self.dispatcher is not None:
+                dispatch(self.dispatcher, "shutdown")
 
-        if self.transfer_ctx is not None:
-            self.transfer_ctx.close()
-            self.transfer_ctx = None
+            if self.transfer_ctx is not None:
+                self.transfer_ctx.close()
+                self.transfer_ctx = None
+            self._metadata_registration_sent = False
 
         self.req_client.close()
         self.request_telemetry.close()
-
     # Helper functions
     def _publish_store_kv_events(self, request_id: str) -> None:
         """Buffer successful store events and update metrics without a drain."""

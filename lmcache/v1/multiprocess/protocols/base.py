@@ -90,6 +90,8 @@ class RequestType(enum.Enum):
     GET_EXPERIMENTAL = enum.auto()
 
     CB_PROTOCOL_HANDSHAKE = enum.auto()
+    # Layout-only KV registration; appended to preserve existing wire IDs.
+    REGISTER_KV_CACHE_METADATA = enum.auto()
 
     # Deprecated aliases.
     CB_REGISTER_ROPE_V3 = CB_REGISTER_ROPE

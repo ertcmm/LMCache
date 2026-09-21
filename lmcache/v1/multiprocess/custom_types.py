@@ -148,6 +148,15 @@ class IPCCacheServerKey:
         )
 
 
+class KVTensorMetadata(msgspec.Struct, frozen=True):
+    """KV-cache tensor geometry used before CUDA IPC import."""
+
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    dtype: str
+    storage_offset: int = 0
+
+
 # Type exports
 KVCache = list[DeviceIPCWrapper]
 

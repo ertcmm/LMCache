@@ -40,6 +40,7 @@ def _bare_gpu_module() -> LMCacheDrivenTransferModule:
     module = LMCacheDrivenTransferModule.__new__(LMCacheDrivenTransferModule)
     module._ctx = MagicMock(name="ctx")
     module._cache_contexts = {}
+    module._metadata_entries = {}
     module._lock = threading.Lock()
     return module
 
@@ -140,6 +141,29 @@ def test_gpu_reap_two_tier_windows() -> None:
     cast(
         MagicMock, module._ctx.layout_desc_registry.unregister
     ).assert_called_once_with("m", 1)
+
+
+def test_gpu_metadata_registration_is_reaped_and_unregistered(monkeypatch) -> None:
+    """Metadata-only registrations are liveness-tracked without CUDA state."""
+    module = _bare_gpu_module()
+    module._ctx.layout_desc_registry.register = MagicMock()
+    module._ctx.layout_desc_registry.unregister = MagicMock()
+    monkeypatch.setattr(
+        gpu_mod,
+        "build_layout_descs_from_metadata",
+        lambda *args, **kwargs: (MagicMock(), MagicMock(), {0: MagicMock()}),
+    )
+
+    module.register_kv_cache_metadata(7, [], "model", 1, MagicMock(), {}, [])
+    assert module.tracked_instance_count() == 1
+    assert 7 in module._metadata_entries
+
+    module.touch_instance(7)
+    assert module._metadata_entries[7].has_liveness_signal is True
+    module._metadata_entries[7].last_seen = time.monotonic() - 1000.0
+
+    assert module.reap_stale_instances(120.0, 3600.0) == [7]
+    module._ctx.layout_desc_registry.unregister.assert_called_once_with("model", 1)
 
 
 def test_gpu_unregister_cleans_up() -> None:

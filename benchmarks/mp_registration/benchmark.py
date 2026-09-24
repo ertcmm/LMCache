@@ -308,6 +308,16 @@ def main() -> None:
 
     first_sample = samples[0]
     steady_summary = _summarize_samples(samples[1:])
+    first_request_delta_ms = (
+        first_sample.ttft_ms - steady_summary["ttft_p50_ms"]
+        if steady_summary is not None
+        else None
+    )
+    first_request_delta_percent = (
+        first_request_delta_ms / steady_summary["ttft_p50_ms"] * 100
+        if steady_summary is not None and steady_summary["ttft_p50_ms"] > 0
+        else None
+    )
     result = {
         "mode": args.mode,
         "model": model,
@@ -315,11 +325,8 @@ def main() -> None:
         "request_count": len(samples),
         "first_operation": asdict(first_sample),
         "steady_state": steady_summary,
-        "first_request_ttft_delta_vs_steady_p50_ms": (
-            first_sample.ttft_ms - steady_summary["ttft_p50_ms"]
-            if steady_summary is not None
-            else None
-        ),
+        "first_request_ttft_delta_vs_steady_p50_ms": first_request_delta_ms,
+        "first_request_ttft_delta_vs_steady_p50_percent": first_request_delta_percent,
         "registration_logs": _summarize_registration_logs(
             args.client_log,
             args.server_log,

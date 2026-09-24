@@ -42,7 +42,11 @@ The first request is labeled `first_operation`; the remaining requests are
 summarized as steady state. The output includes metadata registration, full
 client registration, server CUDA IPC registration, and the first-operation
 gate timings from the provided logs. It also reports those full-registration
-and gate timings as fractions of `--mq-timeout`.
+and gate timings as fractions of `--mq-timeout`. The TTFT delta is reported in
+milliseconds and as a percentage of the steady-state TTFT p50:
+`(first_request_ttft - steady_state_ttft_p50) / steady_state_ttft_p50 * 100`.
+This compares the first request with later requests on the same modified worker;
+it is not a before/after comparison with the pre-change code.
 
 ## Measure the first RETRIEVE
 

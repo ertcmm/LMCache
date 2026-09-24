@@ -879,7 +879,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if len(request_ids) == 0:
             return
 
-        event = self.worker_adapter.create_recorded_event()
+        event = self.worker_adapter.create_recorded_event(trigger="RETRIEVE")
 
         self.worker_adapter.batched_submit_retrieve_requests(
             request_ids,
@@ -960,7 +960,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 dispatch(self.dispatcher, "wait_for_save", event=None)
             return
 
-        event = self.worker_adapter.create_recorded_event()
+        event = self.worker_adapter.create_recorded_event(trigger="STORE")
 
         self.worker_adapter.batched_submit_store_requests(
             request_ids,

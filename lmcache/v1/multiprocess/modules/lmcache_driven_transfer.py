@@ -611,6 +611,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 (already msgspec-decoded by the message queue).
         """
         now = time.monotonic()
+        registration_started_at = time.perf_counter()
         # NOOP-register: an already-registered instance (e.g. a recovering
         # worker re-registering on its first ping) refreshes its last-seen
         # time so a stale entry is not reaped right after recovery. REGISTER
@@ -680,6 +681,14 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             "Registered KV cache for GPU ID %d with %d layers",
             instance_id,
             cache_context.num_layers,
+        )
+        logger.info(
+            "MP server CUDA IPC registration completed: instance_id=%d "
+            "layers=%d device=%s latency_ms=%.3f",
+            instance_id,
+            cache_context.num_layers,
+            cache_context.device,
+            (time.perf_counter() - registration_started_at) * 1000,
         )
 
     @request_handler(RequestType.UNREGISTER_KV_CACHE)

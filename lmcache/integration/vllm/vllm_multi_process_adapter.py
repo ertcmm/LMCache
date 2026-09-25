@@ -1402,11 +1402,8 @@ class LMCacheMPWorkerAdapter:
             except BaseException:
                 transfer_ctx.close()
                 raise
-            old_transfer_ctx = self.transfer_ctx
             self.transfer_ctx = transfer_ctx
             self._metadata_registration_sent = False
-            if old_transfer_ctx is not None:
-                old_transfer_ctx.close()
             logger.info(
                 "MP CUDA IPC client registration round trip completed: "
                 "instance_id=%d latency_ms=%.3f mq_timeout_s=%.3f",
@@ -1859,25 +1856,24 @@ class LMCacheMPWorkerAdapter:
                 self._heartbeat.stop()
 
         with self._transfer_context_lock:
-            if self.transfer_ctx is not None or self._metadata_registration_sent:
-                logger.info("Unregistering kv caches")
-                try:
-                    unregister_type = (
-                        RequestType.UNREGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT
-                        if isinstance(self.transfer_ctx, EngineDrivenTransferContext)
-                        else RequestType.UNREGISTER_KV_CACHE
-                    )
-                    send_lmcache_request(
-                        self.mq_client,
-                        unregister_type,
-                        [self.instance_id],
-                    ).result(timeout=self._mq_timeout)
-                except TimeoutError:
-                    logger.warning(
-                        "LMCache server did not respond to unregister within %ss. "
-                        "Proceeding with shutdown.",
-                        self._mq_timeout,
-                    )
+            logger.info("Unregistering kv caches")
+            try:
+                unregister_type = (
+                    RequestType.UNREGISTER_KV_CACHE_ENGINE_DRIVEN_CONTEXT
+                    if isinstance(self.transfer_ctx, EngineDrivenTransferContext)
+                    else RequestType.UNREGISTER_KV_CACHE
+                )
+                send_lmcache_request(
+                    self.mq_client,
+                    unregister_type,
+                    [self.instance_id],
+                ).result(timeout=self._mq_timeout)
+            except TimeoutError:
+                logger.warning(
+                    "LMCache server did not respond to unregister within %ss. "
+                    "Proceeding with shutdown.",
+                    self._mq_timeout,
+                )
 
             if self.dispatcher is not None:
                 dispatch(self.dispatcher, "shutdown")

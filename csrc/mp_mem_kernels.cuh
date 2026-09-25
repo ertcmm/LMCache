@@ -27,11 +27,11 @@ struct PageBufferShapeDesc {
   // semantics already absorb every inner-dim extent (including
   // ``kv_size``), so DO NOT pre-multiply by any inner dim.
   //
-  // Honoured today only by NL_X_NB_BS_HS (per-layer [NB, BS, HS],
-  // MLA). NL_X_NB_TWO_BS_NH_HS is restricted to the tight form
-  // upstream and leaves this field at 0; all other formats either
-  // pack non-block info into dim-0 or do not support dim-0 padding,
-  // and ignore this field.
+  // Used by supported block-first MLA and content-size layouts, including
+  // NL_X_NB_NH_BS_CS ([NB, NH, BS, CS]) and NL_X_NB_BS_NH_CS
+  // ([NB, BS, NH, CS]). NL_X_NB_TWO_BS_NH_HS remains restricted to the tight
+  // form upstream; other formats must leave this field at 0 unless their
+  // transfer path explicitly supports dim-0 padding.
   int block_stride_elems;
 
   template <typename ScalarType>
@@ -47,8 +47,7 @@ struct PageBufferShapeDesc {
   // Per (K or V) block step along dim-0, expressed in ``ScalarType``
   // element units (the kernel's working dtype, e.g. uint4 / uint32_t /
   // uint16_t). Returns the tight ``bs * nh * hs`` by default, or the
-  // physical ``block_stride_elems`` when dim-0 carries padding (today
-  // only NL_X_NB_BS_HS, see ``block_stride_elems`` above). Every
+  // physical ``block_stride_elems`` when dim-0 carries padding. Every
   // ``calculate_engine_global_offset`` branch uses this as the dim-0
   // step, so honouring padding here propagates to all formats without
   // per-branch changes.

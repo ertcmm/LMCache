@@ -1278,6 +1278,7 @@ class LMCacheMPWorkerAdapter:
         self, kv_caches: dict[str, torch.Tensor]
     ) -> None:
         """Register lookup layout without exporting CUDA IPC handles."""
+        registration_started_at = time.perf_counter()
         tensor_metadata = [
             KVTensorMetadata(
                 shape=tuple(int(dim) for dim in tensor.shape),
@@ -1308,15 +1309,24 @@ class LMCacheMPWorkerAdapter:
                 f"registration within {self._mq_timeout}s. Is the server running?"
             ) from None
         self._metadata_registration_sent = True
+        logger.info(
+            "MP KV cache metadata registration completed: instance_id=%d "
+            "latency_ms=%.3f",
+            self.instance_id,
+            (time.perf_counter() - registration_started_at) * 1000,
+        )
 
     def ensure_transfer_context_registered(self) -> None:
         """Ensure full registration before integrations export CUDA IPC data."""
         self._ensure_transfer_context_registered()
 
-    def _ensure_transfer_context_registered(self) -> None:
+    def _ensure_transfer_context_registered(
+        self, trigger: str = "transfer operation"
+    ) -> None:
         """Promote deferred metadata registration before the first transfer."""
         if self.transfer_ctx is not None:
             return
+        registration_started_at = time.perf_counter()
         with self._transfer_context_lock:
             if self.transfer_ctx is not None:
                 return
@@ -1326,6 +1336,14 @@ class LMCacheMPWorkerAdapter:
                     "before submitting requests."
                 )
             self._send_register_kv_caches_request(self.kv_caches)
+        logger.info(
+            "MP CUDA IPC registration gate completed: instance_id=%d "
+            "trigger=%s latency_ms=%.3f mq_timeout_s=%.3f",
+            self.instance_id,
+            trigger,
+            (time.perf_counter() - registration_started_at) * 1000,
+            self._mq_timeout,
+        )
 
     def _block_ids_per_group(self, op: LoadStoreOp) -> list[list[int]]:
         return expand_engine_block_ids(self.engine_group_infos, op.block_ids)
@@ -1348,6 +1366,7 @@ class LMCacheMPWorkerAdapter:
         """
         with self._transfer_context_lock:
             self.kv_caches = kv_caches
+            registration_started_at = time.perf_counter()
             transfer_ctx = create_transfer_context(
                 kv_caches, mode=self._mp_transfer_mode
             )
@@ -1366,6 +1385,13 @@ class LMCacheMPWorkerAdapter:
                     engine_type=EngineType.VLLM,
                 )
             except TimeoutError:
+                logger.error(
+                    "MP CUDA IPC registration timed out: instance_id=%d "
+                    "latency_ms=%.3f mq_timeout_s=%.3f",
+                    self.instance_id,
+                    (time.perf_counter() - registration_started_at) * 1000,
+                    self._mq_timeout,
+                )
                 transfer_ctx.close()
                 raise ConnectionError(
                     "LMCache server did not respond to "
@@ -1380,6 +1406,13 @@ class LMCacheMPWorkerAdapter:
             self._metadata_registration_sent = False
             if old_transfer_ctx is not None:
                 old_transfer_ctx.close()
+            logger.info(
+                "MP CUDA IPC client registration round trip completed: "
+                "instance_id=%d latency_ms=%.3f mq_timeout_s=%.3f",
+                self.instance_id,
+                (time.perf_counter() - registration_started_at) * 1000,
+                self._mq_timeout,
+            )
 
     def _ensure_heartbeat_started(self) -> None:
         """Lazily start the heartbeat thread on first store/retrieve.
@@ -1491,7 +1524,7 @@ class LMCacheMPWorkerAdapter:
         if not self.is_healthy:
             return
 
-        self._ensure_transfer_context_registered()
+        self._ensure_transfer_context_registered("STORE")
 
         assert op.token_ids is not None
         key = self._create_key(
@@ -1547,7 +1580,7 @@ class LMCacheMPWorkerAdapter:
             self._dropped_retrieves.add(request_id)
             return
 
-        self._ensure_transfer_context_registered()
+        self._ensure_transfer_context_registered("RETRIEVE")
 
         assert op.token_ids is not None
         key = self._create_key(

@@ -401,10 +401,29 @@ void multi_layer_block_kv_transfer_templated(
   const int64_t* block_ids_ptr = block_ids.data_ptr<int64_t>();
 
   // --- Grid and block dimensions ---
+  constexpr int kMaxThreadsPerBlock = 1024;
+  constexpr int kMaxThreadsPerHead = 32;  // One warp at most per head.
+
   int elements_per_head = shape_desc.hs * shape_desc.element_size /
                           static_cast<int>(sizeof(ScalarType));
-  int thread_dim_x = std::min(elements_per_head, 32);
   int thread_dim_y = shape_desc.nh;
+  TORCH_CHECK(thread_dim_y > 0, "NH dimension must be positive, got ",
+              thread_dim_y);
+  TORCH_CHECK(thread_dim_y <= kMaxThreadsPerBlock,
+              "NH dimension (", thread_dim_y,
+              ") exceeds the maximum supported by one CUDA block (",
+              kMaxThreadsPerBlock, ")");
+  TORCH_CHECK(elements_per_head > 0,
+              "Head size must contain at least one transfer element, got ",
+              elements_per_head);
+
+  // Keep the block within CUDA's 1024-thread limit. For NH > 32, reduce
+  // x rather than rejecting the shape: warp_copy uses threadIdx.x as a
+  // strided loop and has no warp-wide operations, so a partial warp per head
+  // remains correct (with less parallelism for each head).
+  int max_threads_x = kMaxThreadsPerBlock / thread_dim_y;
+  int thread_dim_x =
+      std::min(elements_per_head, std::min(kMaxThreadsPerHead, max_threads_x));
 
   dim3 block(thread_dim_x, thread_dim_y);
   dim3 grid(shape_desc.kv_size, total_blocks, shape_desc.nl);

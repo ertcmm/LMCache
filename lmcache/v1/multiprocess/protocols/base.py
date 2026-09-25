@@ -40,6 +40,7 @@ class RequestType(enum.Enum):
 
     # Engine operations
     REGISTER_KV_CACHE = enum.auto()
+    REGISTER_KV_CACHE_METADATA = enum.auto()
     UNREGISTER_KV_CACHE = enum.auto()
     REGISTER_Q_CACHE = enum.auto()
     UNREGISTER_Q_CACHE = enum.auto()

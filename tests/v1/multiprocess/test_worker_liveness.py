@@ -26,6 +26,7 @@ from lmcache.v1.multiprocess.modules.engine_driven_transfer import (
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     ContextEntry,
     LMCacheDrivenTransferModule,
+    MetadataEntry,
 )
 from lmcache.v1.multiprocess.modules.management import ManagementModule
 from lmcache.v1.periodic_thread import PeriodicThreadRegistry
@@ -40,6 +41,7 @@ def _bare_gpu_module() -> LMCacheDrivenTransferModule:
     module = LMCacheDrivenTransferModule.__new__(LMCacheDrivenTransferModule)
     module._ctx = MagicMock(name="ctx")
     module._cache_contexts = {}
+    module._metadata_entries = {}
     module._lock = threading.Lock()
     return module
 
@@ -154,6 +156,22 @@ def test_gpu_unregister_cleans_up() -> None:
     ).assert_called_once_with("m", 1)
 
     module.unregister_kv_cache(1)  # already gone -> no exception
+
+
+def test_gpu_metadata_registration_is_reaped_and_unregistered() -> None:
+    """Stale metadata-only registrations release their lookup layout."""
+    module = _bare_gpu_module()
+    module._metadata_entries[7] = MetadataEntry(
+        "model", 1, last_seen=time.monotonic() - 1000.0, has_liveness_signal=True
+    )
+
+    reaped = module.reap_stale_instances(120.0, 3600.0)
+
+    assert reaped == [7]
+    assert module.tracked_instance_count() == 0
+    cast(
+        MagicMock, module._ctx.layout_desc_registry.unregister
+    ).assert_called_once_with("model", 1)
 
 
 def test_non_gpu_reap_pops_strategy_as_pair() -> None:

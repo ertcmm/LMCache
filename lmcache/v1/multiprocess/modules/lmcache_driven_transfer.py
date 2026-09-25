@@ -19,6 +19,7 @@ from lmcache.utils import (
     _lmcache_nvtx_annotate,
 )
 from lmcache.v1.distributed.api import (
+    AttnWindowDesc,
     MemoryLayoutDesc,
     ObjectKey,
 )
@@ -27,13 +28,18 @@ from lmcache.v1.gpu_connector.gpu_ops import (
     lmcache_memcpy_async_d2h,
     lmcache_memcpy_async_h2d,
 )
-from lmcache.v1.gpu_connector.utils import LayoutHints
+from lmcache.v1.gpu_connector.utils import (
+    LayoutHints,
+    normalize_and_discover_per_layer_formats,
+)
+from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
 from lmcache.v1.memory_allocators.lazy_memory_allocator import LazyMemoryAllocator
 from lmcache.v1.memory_management import GDSMemoryObject, MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
     KVCache,
+    KVTensorMetadata,
 )
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 from lmcache.v1.multiprocess.engine_module import (
@@ -41,7 +47,10 @@ from lmcache.v1.multiprocess.engine_module import (
     InstanceLivenessTarget,
     ThreadPoolType,
 )
-from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+from lmcache.v1.multiprocess.group_view import (
+    EngineGroupInfo,
+    engine_group_layer_indices,
+)
 from lmcache.v1.multiprocess.native_completion import (
     DeviceHostFuncDispatcher,
     submit_callback_to_stream,
@@ -89,6 +98,82 @@ def get_layout_desc(
     ]
     shapes, dtypes = zip(*shapes_and_dtypes, strict=False)
     return MemoryLayoutDesc(shapes=list(shapes), dtypes=list(dtypes))
+
+
+def _torch_dtype_from_name(dtype_name: str) -> torch.dtype:
+    """Resolve a serialized torch dtype without importing CUDA storage."""
+    name = dtype_name.removeprefix("torch.")
+    dtype = getattr(torch, name, None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"Unsupported serialized KV-cache dtype: {dtype_name!r}")
+    return dtype
+
+
+def _metadata_tensor(metadata: KVTensorMetadata) -> torch.Tensor:
+    """Build a meta-device tensor carrying only KV layout information."""
+    return torch.empty_strided(
+        tuple(metadata.shape),
+        tuple(metadata.stride),
+        dtype=_torch_dtype_from_name(metadata.dtype),
+        device="meta",
+    )
+
+
+def build_layout_descs_from_metadata(
+    tensor_metadata: Sequence[KVTensorMetadata],
+    chunk_size: int,
+    engine_type: EngineType,
+    layout_hints: LayoutHints,
+    engine_group_infos: Sequence[EngineGroupInfo],
+    *,
+    separate_object_groups: bool,
+    full_sw_kv: bool,
+) -> tuple[MemoryLayoutDesc, AttnWindowDesc, dict[int, MemoryLayoutDesc]]:
+    """Derive lookup layouts from metadata without importing CUDA IPC storage."""
+    if not tensor_metadata:
+        raise ValueError("Cannot build KV layout metadata from an empty cache")
+
+    meta_caches = [_metadata_tensor(item) for item in tensor_metadata]
+    normalized, engine_kv_formats = normalize_and_discover_per_layer_formats(
+        meta_caches,
+        engine_group_layer_indices(engine_group_infos),
+        engine_type,
+        layout_hints,
+    )
+    groups = KVLayerGroupsManager(
+        normalized,
+        engine_kv_formats=engine_kv_formats,
+        engine_group_infos=engine_group_infos,
+        lmcache_tokens_per_chunk=chunk_size,
+        separate_object_groups=separate_object_groups,
+    )
+    if full_sw_kv:
+        groups.enable_full_sw_kv()
+
+    def layout_for_object_group(object_group_id: int) -> MemoryLayoutDesc:
+        shapes: list[torch.Size] = []
+        dtypes: list[torch.dtype] = []
+        object_group = groups.object_groups[object_group_id]
+        for kernel_group_idx in object_group.kernel_group_indices:
+            group = groups.kernel_groups[kernel_group_idx]
+            shapes.append(
+                torch.Size(
+                    (
+                        group.shape_desc.kv_size,
+                        group.num_layers,
+                        groups.get_slots_per_chunk_in_sw(kernel_group_idx),
+                        group.hidden_dim_size,
+                    )
+                )
+            )
+            dtypes.append(group.dtype)
+        return MemoryLayoutDesc(shapes=shapes, dtypes=dtypes)
+
+    group_layout_descs = {
+        group_id: layout_for_object_group(group_id)
+        for group_id in range(groups.num_object_groups)
+    }
+    return group_layout_descs[0], groups.get_attn_desc(), group_layout_descs
 
 
 def batched_iteration_with_skip(
@@ -577,6 +662,16 @@ def transfer_kv_per_object_group(
 
 
 @dataclass
+class MetadataEntry:
+    """Layout-only registration awaiting full CUDA IPC promotion."""
+
+    model_name: str
+    world_size: int
+    last_seen: float = 0.0
+    has_liveness_signal: bool = False
+
+
+@dataclass
 class ContextEntry:
     """Registered cache context metadata for a single worker instance.
 
@@ -621,6 +716,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
     def __init__(self, ctx: MPCacheServerContext) -> None:
         self._ctx = ctx
         self._cache_contexts: dict[int, ContextEntry] = {}
+        # Layout-only registrations contain no imported CUDA storage and are
+        # promoted when the worker sends its first full registration.
+        self._metadata_entries: dict[int, MetadataEntry] = {}
         # Guards all reads/writes of _cache_contexts. The reaper mutates it
         # off the MQ main loop, so register/unregister/store/retrieve and
         # report_status all serialize through this lock. Held only for dict
@@ -692,11 +790,16 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             if entry is not None:
                 entry.last_seen = now
                 entry.has_liveness_signal = True
+                return
+            metadata_entry = self._metadata_entries.get(instance_id)
+            if metadata_entry is not None:
+                metadata_entry.last_seen = now
+                metadata_entry.has_liveness_signal = True
 
     def tracked_instance_count(self) -> int:
         """Return the number of currently registered instances."""
         with self._lock:
-            return len(self._cache_contexts)
+            return len(self._cache_contexts) + len(self._metadata_entries)
 
     def reap_stale_instances(
         self, reap_timeout_s: float, registration_grace_s: float
@@ -715,6 +818,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         """
         now = time.monotonic()
         reaped: list[tuple[int, ContextEntry]] = []
+        reaped_metadata: list[tuple[int, MetadataEntry]] = []
         with self._lock:
             stale_ids = [
                 iid
@@ -728,6 +832,18 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             ]
             for iid in stale_ids:
                 reaped.append((iid, self._cache_contexts.pop(iid)))
+            stale_metadata_ids = [
+                iid
+                for iid, entry in self._metadata_entries.items()
+                if now - entry.last_seen
+                > (
+                    reap_timeout_s
+                    if entry.has_liveness_signal
+                    else registration_grace_s
+                )
+            ]
+            for iid in stale_metadata_ids:
+                reaped_metadata.append((iid, self._metadata_entries.pop(iid)))
         reaped_ids: list[int] = []
         entries: list[ContextEntry] = []
         for iid, e in reaped:
@@ -743,6 +859,18 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             del e  # a bound name would pin the final entry (see _release_entries)
             reaped.clear()
             self._release_entries(entries)
+        for iid, metadata_entry in reaped_metadata:
+            logger.warning(
+                "Reaped GPU layout metadata for instance %d: silent for %.1fs "
+                "(pinged=%s)",
+                iid,
+                now - metadata_entry.last_seen,
+                metadata_entry.has_liveness_signal,
+            )
+            reaped_ids.append(iid)
+            self._ctx.layout_desc_registry.unregister(
+                metadata_entry.model_name, metadata_entry.world_size
+            )
         return reaped_ids
 
     def _release_entries(self, entries: list[ContextEntry]) -> None:
@@ -780,6 +908,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             HandlerSpec(
                 RequestType.REGISTER_KV_CACHE,
                 self.register_kv_cache,
+                ThreadPoolType.SYNC,
+            ),
+            HandlerSpec(
+                RequestType.REGISTER_KV_CACHE_METADATA,
+                self.register_kv_cache_metadata,
                 ThreadPoolType.SYNC,
             ),
             HandlerSpec(
@@ -832,7 +965,72 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         with self._lock:
             entries = list(self._cache_contexts.values())
             self._cache_contexts.clear()
+            metadata_entries = list(self._metadata_entries.values())
+            self._metadata_entries.clear()
         self._release_entries(entries)
+        for entry in metadata_entries:
+            self._ctx.layout_desc_registry.unregister(
+                entry.model_name, entry.world_size
+            )
+
+    def register_kv_cache_metadata(
+        self,
+        instance_id: int,
+        kv_caches: list[KVTensorMetadata],
+        model_name: str,
+        world_size: int,
+        engine_type: EngineType,
+        layout_hints: LayoutHints,
+        engine_group_infos: list[EngineGroupInfo],
+    ) -> None:
+        """Register lookup layout without importing CUDA IPC storage."""
+        now = time.monotonic()
+        with self._lock:
+            if instance_id in self._cache_contexts:
+                self._cache_contexts[instance_id].last_seen = now
+                return
+            existing = self._metadata_entries.get(instance_id)
+            if existing is not None:
+                existing.last_seen = now
+                return
+
+        layout_desc, attn_desc, group_layout_descs = (
+            build_layout_descs_from_metadata(
+                kv_caches,
+                self._ctx.chunk_size,
+                engine_type,
+                layout_hints,
+                engine_group_infos,
+                separate_object_groups=self._ctx.separate_object_groups,
+                full_sw_kv=self._ctx.full_sw_kv,
+            )
+        )
+        self._ctx.layout_desc_registry.register(
+            model_name,
+            world_size,
+            layout_desc,
+            attn_desc,
+            group_layout_descs=group_layout_descs,
+        )
+        with self._lock:
+            duplicate = (
+                instance_id in self._cache_contexts
+                or instance_id in self._metadata_entries
+            )
+            if not duplicate:
+                self._metadata_entries[instance_id] = MetadataEntry(
+                    model_name=model_name,
+                    world_size=world_size,
+                    last_seen=now,
+                    has_liveness_signal=False,
+                )
+        if duplicate:
+            self._ctx.layout_desc_registry.unregister(model_name, world_size)
+            return
+        logger.info(
+            "Registered KV layout metadata for GPU ID %d without importing CUDA IPC",
+            instance_id,
+        )
 
     def register_kv_cache(
         self,
@@ -917,6 +1115,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 has_liveness_signal=False,
                 event_backend=event_backend,
             )
+            metadata_entry = self._metadata_entries.pop(instance_id, None)
+
+        if metadata_entry is not None:
+            self._ctx.layout_desc_registry.unregister(
+                metadata_entry.model_name, metadata_entry.world_size
+            )
 
         logger.info(
             "Registered KV cache for GPU ID %d with %d layers",
@@ -931,20 +1135,22 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             instance_id: The GPU instance ID (such as PID).
         """
         with self._lock:
-            popped = [
-                e
-                for e in (self._cache_contexts.pop(instance_id, None),)
-                if e is not None
-            ]
-        if not popped:
+            entry = self._cache_contexts.pop(instance_id, None)
+            metadata_entry = self._metadata_entries.pop(instance_id, None)
+        if entry is None and metadata_entry is None:
             logger.warning(
                 "No registered GPU context found for instance ID %d", instance_id
             )
             return
 
-        # No scalar binding: `popped` must stay the only reference so
-        # _release_entries' reclaim actually unmaps the IPC segments.
-        self._release_entries(popped)
+        if entry is not None:
+            # This must remain the only reference so _release_entries can
+            # reclaim the imported IPC segment.
+            self._release_entries([entry])
+        if metadata_entry is not None:
+            self._ctx.layout_desc_registry.unregister(
+                metadata_entry.model_name, metadata_entry.world_size
+            )
         logger.info("Unregistered KV cache for GPU ID %d", instance_id)
 
     @_lmcache_nvtx_annotate

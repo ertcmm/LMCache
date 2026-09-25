@@ -123,6 +123,17 @@ def _op(block_ids: list[list[int]]) -> LoadStoreOp:
     return LoadStoreOp(token_ids=[1, 2, 3, 4], block_ids=block_ids, start=0, end=4)
 
 
+def _fake_cuda_tensor() -> MagicMock:
+    """Build a CUDA tensor double with the metadata used during registration."""
+    tensor = MagicMock()
+    tensor.device.type = "cuda"
+    tensor.shape = (2, 8, 4, 2, 8)
+    tensor.stride.return_value = (1024, 128, 32, 16, 1)
+    tensor.dtype = torch.float16
+    tensor.storage_offset.return_value = 0
+    return tensor
+
+
 def _patch_transfer_context_factory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> list[MagicMock]:
@@ -188,10 +199,9 @@ def fake_adapter(monkeypatch):
 
 
 def test_register_kv_caches_updates_kv_caches_and_submits(fake_adapter):
-    """Public register_kv_caches stores the dict and submits one request."""
+    """CUDA registration sends layout metadata without importing IPC storage."""
     adapter, send_mock, _ = fake_adapter
-    fake_tensor = MagicMock()
-    fake_tensor.device.type = "cuda"
+    fake_tensor = _fake_cuda_tensor()
     new_caches = {"layer.0": fake_tensor, "layer.1": fake_tensor}
 
     adapter.register_kv_caches(new_caches)
@@ -199,7 +209,8 @@ def test_register_kv_caches_updates_kv_caches_and_submits(fake_adapter):
     assert adapter.kv_caches is new_caches
     assert send_mock.call_count == 1
     args, _kwargs = send_mock.call_args
-    assert args[1] == RequestType.REGISTER_KV_CACHE
+    assert args[1] == RequestType.REGISTER_KV_CACHE_METADATA
+    assert len(args[2][1]) == 2
 
 
 def test_register_kv_caches_raises_connection_error_on_timeout(fake_adapter):
@@ -208,9 +219,25 @@ def test_register_kv_caches_raises_connection_error_on_timeout(fake_adapter):
     future.result.side_effect = TimeoutError("server down")
 
     with pytest.raises(ConnectionError, match="did not respond"):
-        fake_tensor = MagicMock()
-        fake_tensor.device.type = "cuda"
+        fake_tensor = _fake_cuda_tensor()
         adapter.register_kv_caches({"layer.0": fake_tensor})
+
+
+def test_first_transfer_promotes_metadata_registration(fake_adapter, monkeypatch):
+    """The first transfer registers CUDA IPC after metadata-only startup."""
+    adapter, send_mock, _ = fake_adapter
+    contexts = _patch_transfer_context_factory(monkeypatch)
+    adapter.register_kv_caches({"layer.0": _fake_cuda_tensor()})
+
+    assert adapter.transfer_ctx is None
+    assert len(contexts) == 0
+
+    adapter.submit_store_request("req-1", _op([[0]]), MagicMock())
+
+    assert len(contexts) == 1
+    contexts[0].register.assert_called_once()
+    assert adapter.transfer_ctx is contexts[0]
+    assert send_mock.call_args.args[1] == RequestType.REGISTER_KV_CACHE_METADATA
 
 
 def test_register_kv_caches_cpu_submits_engine_driven_context_registration(
@@ -238,8 +265,7 @@ def test_submit_store_request_tracks_returned_future(fake_adapter, monkeypatch):
     """submit_store_request stores the returned future in store_futures."""
     adapter, _send_mock, _ = fake_adapter
     monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
-    fake_tensor = MagicMock()
-    fake_tensor.device.type = "cuda"
+    fake_tensor = _fake_cuda_tensor()
     adapter.kv_caches = {"layer.0": fake_tensor}
     transfer_ctx = MagicMock()
     fake_future = MagicMock()
@@ -258,8 +284,7 @@ def test_submit_store_request_tracks_returned_future(fake_adapter, monkeypatch):
 def test_submit_store_request_expands_block_ids_to_views(fake_adapter, monkeypatch):
     adapter, _send_mock, _ = fake_adapter
     monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
-    fake_tensor = MagicMock()
-    fake_tensor.device.type = "cuda"
+    fake_tensor = _fake_cuda_tensor()
     adapter.kv_caches = {"layer.0": fake_tensor}
     adapter.engine_group_infos = [
         EngineGroupInfo(0, (0, 2)),
@@ -290,8 +315,7 @@ def test_submit_retrieve_request_tracks_returned_future(fake_adapter, monkeypatc
     """submit_retrieve_request stores returned future and block IDs."""
     adapter, _send_mock, _ = fake_adapter
     monkeypatch.setattr(adapter, "_ensure_heartbeat_started", lambda: None)
-    fake_tensor = MagicMock()
-    fake_tensor.device.type = "cuda"
+    fake_tensor = _fake_cuda_tensor()
     adapter.kv_caches = {"layer.0": fake_tensor}
     transfer_ctx = MagicMock()
     fake_future = MagicMock()
@@ -614,8 +638,7 @@ def test_recover_callback_skips_register_after_stop_requested(
     adapter, _send_mock, _ = fake_adapter
     contexts = _patch_transfer_context_factory(monkeypatch)
 
-    fake_tensor = MagicMock()
-    fake_tensor.device.type = "cuda"
+    fake_tensor = _fake_cuda_tensor()
     adapter.register_kv_caches({"layer.0": fake_tensor})
     adapter.submit_store_request("req-1", _op([[0]]), MagicMock())
     heartbeat = FakeHeartbeatThread.instances[0]
@@ -689,8 +712,8 @@ def test_register_uses_local_context_when_self_transfer_ctx_nulled(
         mq_timeout=5.0,
     )
 
-    fake_tensor = MagicMock()
-    fake_tensor.device.type = "cuda"
+    fake_tensor = _fake_cuda_tensor()
+    monkeypatch.setattr(adapter, "_should_defer_kv_cache_registration", lambda kv: False)
     # Under the bug this raises AttributeError (None.register).
     adapter.register_kv_caches({"layer.0": fake_tensor})
 
@@ -743,8 +766,7 @@ def test_recover_callback_rebuilds_transfer_ctx_without_closing_previous(
     adapter, _send_mock, _ = fake_adapter
     contexts = _patch_transfer_context_factory(monkeypatch)
 
-    fake_tensor = MagicMock()
-    fake_tensor.device.type = "cuda"
+    fake_tensor = _fake_cuda_tensor()
     adapter.register_kv_caches({"layer.0": fake_tensor})  # contexts[0]
     # Start the heartbeat (healthy, no recover) so the callback is wired.
     adapter.submit_store_request("req-1", _op([[0]]), MagicMock())

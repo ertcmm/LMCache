@@ -3,6 +3,7 @@
 # Standard
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
+import hashlib
 import math
 import sys
 import time
@@ -77,6 +78,7 @@ from lmcache.integration.vllm.lmcache_mp_metrics import (
 from lmcache.integration.vllm.mp_server_launcher import (
     is_mp_server_autostart_enabled,
 )
+from lmcache.integration.vllm.mp_parallel_topology import build_mp_server_routes
 from lmcache.integration.vllm.utils import (
     mla_only,
     vllm_layout_hints,
@@ -469,7 +471,7 @@ def validate_dcp_support(
         )
 
     ranks_per_server = pc.world_size // n_servers
-    if ranks_per_server < dcp_size:
+    if pc.pipeline_parallel_size == 1 and ranks_per_server < dcp_size:
         raise ValueError(
             f"Each LMCache server needs at least decode_context_parallel_size "
             f"({dcp_size}) ranks to hold a complete set of shards, but "
@@ -494,14 +496,34 @@ def build_parallel_strategy_from_vllm_config(
         The constructed ParallelStrategy.
     """
     pc = vllm_config.parallel_config
+    model_config = vllm_config.model_config
+    hf_config = getattr(model_config, "hf_text_config", None)
+    if hf_config is None:
+        hf_config = getattr(model_config, "hf_config", None)
+    is_deepseek_v4 = getattr(hf_config, "model_type", None) == "deepseek_v4"
+    partitioned_pp = n_servers > 1 and pc.pipeline_parallel_size > 1
+    replicated_mla = False
+    if partitioned_pp:
+        kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+        if kv_transfer_config is not None:
+            replicated_mla = kv_transfer_config.get_from_extra_config(
+                "lmcache.mp.replicated_mla", False
+            )
+        if not isinstance(replicated_mla, bool):
+            raise ValueError("lmcache.mp.replicated_mla must be a boolean")
     return ParallelStrategy(
-        mla_only=mla_only(vllm_config.model_config),
+        # New MLA models may include non-replicated KV groups. Default to
+        # per-rank storage in partitioned PP; permit verified pure MLA only.
+        mla_only=mla_only(model_config)
+        and (not partitioned_pp or replicated_mla)
+        and not (partitioned_pp and is_deepseek_v4),
         vllm_world_size=pc.world_size,
         vllm_worker_id=pc.rank,
         tp_size=pc.tensor_parallel_size,
         pp_size=pc.pipeline_parallel_size,
         n_servers=n_servers,
         dcp_size=getattr(pc, "decode_context_parallel_size", 1),
+        is_deepseek_v4=is_deepseek_v4,
     )
 
 
@@ -654,17 +676,43 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         validate_dcp_support(vllm_config, n_servers, kv_cache_config)
 
+        pc = vllm_config.parallel_config
+        if pc.world_size % n_servers:
+            raise ValueError(
+                f"world_size ({pc.world_size}) must be divisible by "
+                f"n_servers ({n_servers})"
+            )
+        if n_servers > 1 and pc.pipeline_parallel_size > 1:
+            build_mp_server_routes(
+                server_urls,
+                pc.tensor_parallel_size,
+                pc.pipeline_parallel_size,
+                getattr(pc, "decode_context_parallel_size", 1),
+                mla_only=False,
+            )
+            user_namespace = vllm_config.kv_transfer_config.get_from_extra_config(
+                "lmcache.mp.cache_namespace", ""
+            )
+            if not isinstance(user_namespace, str):
+                raise ValueError("lmcache.mp.cache_namespace must be a string")
+            cache_identity = (
+                getattr(vllm_config.model_config, "revision", None),
+                str(getattr(vllm_config.model_config, "dtype", "")),
+                vllm_config.cache_config.cache_dtype,
+                getattr(pc, "decode_context_parallel_size", 1),
+                vllm_config.kv_transfer_config.get_from_extra_config(
+                    "lmcache.mp.replicated_mla", False
+                ),
+                user_namespace,
+            )
+            abi_tag = hashlib.sha256(repr(cache_identity).encode()).hexdigest()[:16]
+            cache_model_name += f"#mp-pp-cache-v1-{abi_tag}"
         logger.info(
             "Resolved LMCache MP geometry: group_tokens_per_block=%s, "
             "scheduler_block_size=%d, cache_model_name=%s",
             group_tokens_per_block,
             scheduler_block_size,
             cache_model_name,
-        )
-
-        assert vllm_config.parallel_config.world_size % n_servers == 0, (
-            f"world_size ({vllm_config.parallel_config.world_size}) must be "
-            f"divisible by n_servers ({n_servers})"
         )
 
         # Multi-server + DP is not supported yet.
@@ -676,20 +724,6 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "DP across multiple LMCache servers will be "
                 "supported in a follow-up PR."
             )
-
-        # Multi-server + MLA: only TP is supported (no PP).
-        # PP splits layers across nodes, which would cause per-piece
-        # reader counts to vary per (server, pp_stage) pair and break
-        # the single-``tp_size`` LOOKUP / FREE_LOOKUP_LOCKS protocol.
-        # Non-MLA mode is not affected by this restriction.
-        if n_servers > 1:
-            pp_size = vllm_config.parallel_config.pipeline_parallel_size
-            if pp_size > 1:
-                raise ValueError(
-                    "LMCacheMPConnector multi-server mode only supports "
-                    "tensor parallelism (TP), not pipeline parallelism (PP). "
-                    f"Got pp_size={pp_size}."
-                )
 
         zmq_context = zmq.Context.instance()
         parallel_strategy = build_parallel_strategy_from_vllm_config(

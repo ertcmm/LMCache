@@ -111,6 +111,12 @@ elif [ "$TEST_NAME" = "dsv4_flash_tp" ]; then
     # model name is declared here so the banner and the script's ${MODEL:-}
     # fallback both resolve to DeepSeek-V4-Flash.
     export MODEL="${MODEL:-deepseek-ai/DeepSeek-V4-Flash}"
+elif [ "$TEST_NAME" = "multi_server_pp" ]; then
+    # The self-contained vLLM workload launches TP=1 PP=2 and one LMCache
+    # server per stage. It owns both server processes and needs two GPUs.
+    export MODEL="${MODEL:-Qwen/Qwen3-14B}"
+    export LMCACHE_PP_PORT="${LMCACHE_PP_PORT:-6556}"
+    export LMCACHE_EXTRA_PORTS="${LMCACHE_PP_PORT}"
 elif [ "$TEST_NAME" = "deadlock" ]; then
     # The workload is engine-neutral, while each adapter owns the launch flags
     # needed to reproduce the high-concurrency TP=2 scenario.
@@ -160,7 +166,7 @@ echo "Results dir: $RESULTS_DIR"
 echo ""
 
 # Tests that still handle their own server lifecycle.
-SELF_CONTAINED_TESTS=" mp_autostart_tp2 p2p kimi_linear_tp dsv4_flash_tp "
+SELF_CONTAINED_TESTS=" mp_autostart_tp2 p2p kimi_linear_tp dsv4_flash_tp multi_server_pp "
 
 # Tests that compare against a baseline engine (no LMCache) on a second GPU.
 # Only these need the baseline server (and thus a 2-GPU pod); everything

@@ -69,6 +69,11 @@ class IPCCacheServerKey:
     # lookups reject it.
     num_kv_readers: int = field(default=0, compare=False)
 
+    # A scheduler lookup may address only the KV pieces hosted by one server.
+    # Empty preserves the legacy all-ranks lookup. Worker store/retrieve keys
+    # leave this empty because worker_id already identifies one piece.
+    selected_worker_ids: tuple[int, ...] = field(default=(), compare=False)
+
     # Duplicated from ObjectKey — cannot import ObjectKey here due to
     # circular dependency (api.py imports IPCCacheServerKey).
     _SALT_FORBIDDEN_CHARS = frozenset("@/\\\x00")
@@ -84,6 +89,15 @@ class IPCCacheServerKey:
             raise ValueError(
                 f"cache_salt exceeds max length {self._SALT_MAX_LEN} "
                 f"(got {len(self.cache_salt)})"
+            )
+        if len(set(self.selected_worker_ids)) != len(self.selected_worker_ids):
+            raise ValueError("selected_worker_ids must not contain duplicates")
+        if any(
+            worker_id < 0 or worker_id >= self.world_size
+            for worker_id in self.selected_worker_ids
+        ):
+            raise ValueError(
+                f"selected_worker_ids must be in [0, {self.world_size})"
             )
 
     # Helper function for unit tests only
@@ -145,11 +159,16 @@ class IPCCacheServerKey:
             request_id=self.request_id,
             cache_salt=self.cache_salt,
             request_configs=self.request_configs,
+            selected_worker_ids=self.selected_worker_ids,
         )
 
 
 # Type exports
 KVCache = list[DeviceIPCWrapper]
+
+# Advertised through GET_EXPERIMENTAL so a partitioned-PP client never sends
+# selected-rank lookups to an older server that silently ignores the field.
+MP_PARTITIONED_PP_CAPABILITY = "mp_partitioned_pp_v1"
 
 
 class RegisterEngineDrivenContextPayload(msgspec.Struct):

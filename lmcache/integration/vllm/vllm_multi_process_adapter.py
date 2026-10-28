@@ -3,6 +3,7 @@
 # Standard
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING, Any, Callable, NoReturn, Protocol
 import enum
 import math
@@ -20,6 +21,12 @@ import zmq
 from lmcache import torch_dev
 from lmcache.integration.request_telemetry.factory import RequestTelemetryFactory
 from lmcache.integration.vllm.experimental import dispatch
+from lmcache.integration.vllm.mp_parallel_topology import (
+    MPServerRoute,
+    build_mp_server_routes,
+    mp_route_request_id,
+    mp_stage_model_name,
+)
 from lmcache.integration.vllm.mp_server_launcher import (
     maybe_start_mp_server_from_url,
     wait_for_mp_server_from_url,
@@ -33,6 +40,7 @@ from lmcache.utils import (
 )
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
+    MP_PARTITIONED_PP_CAPABILITY,
     BlockAllocationRecord,
     IPCCacheServerKey,
 )
@@ -43,6 +51,7 @@ from lmcache.v1.multiprocess.group_view import (
 )
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 from lmcache.v1.multiprocess.transfer_context import (
+    EngineDrivenTransferContext,
     TransferContext,
     create_transfer_context,
 )
@@ -128,6 +137,10 @@ class ExtraConfigDefault(enum.Enum):
     # Must match the MP server's --hash-algorithm setting because KV events
     # expose the same chunk hashes used by server-side object keys.
     hash_algorithm = "blake3"
+    # Explicit L2 cache generation tag for multi-server PP deployments.
+    cache_namespace = ""
+    # Opt in to sharing verified pure-MLA KV within each local TP/DCP route.
+    replicated_mla = False
 
 
 # Backward-compatible aliases for callers that still pass these as
@@ -260,14 +273,14 @@ def get_experimental(
     req_client: RequestClient,
     timeout: float = DEFAULT_MQ_TIMEOUT,
 ) -> set[str]:
-    """Query the experimental capabilities a server advertises.
+    """Query protocol capabilities and experimental transfers a server advertises.
 
     Args:
         req_client: The LMCache multiprocess request client.
         timeout: Seconds to wait for the server's response.
 
     Returns:
-        Experimental features built into the server (now `transfer_query`).
+        Advertised capabilities and intermediate tensor transfer features.
     """
     future = req_client.get_experimental()
     try:
@@ -367,6 +380,64 @@ class ParallelStrategy:
     """Decode-context-parallel size: each chunk's KV is split into
     ``dcp_size`` token shards instead of one replicated copy."""
 
+    is_deepseek_v4: bool = False
+    """The model uses DeepSeek V4 KV layouts, including compressed states."""
+
+    @property
+    def partitioned_pp(self) -> bool:
+        """Whether a pipeline is placed across multiple MP servers."""
+        return self.n_servers > 1 and self.pp_size > 1
+
+    @property
+    def pp_rank(self) -> int:
+        """Pipeline stage containing this worker's registered layers."""
+        return self.vllm_worker_id // self.tp_size
+
+    @cached_property
+    def local_route(self) -> MPServerRoute:
+        """Route whose objects this worker reads on its assigned server."""
+        routes = build_mp_server_routes(
+            tuple(str(i) for i in range(self.n_servers)),
+            self.tp_size,
+            self.pp_size,
+            self.dcp_size,
+            self.mla_only,
+        )
+        return next(
+            route for route in routes if self.vllm_worker_id in route.ranks
+        )
+
+    def model_name_for_stage(self, model_name: str, pp_rank: int) -> str:
+        """Return the shared cache namespace of a pipeline stage.
+
+        Args:
+            model_name: Base cache namespace.
+            pp_rank: Pipeline stage.
+
+        Returns:
+            The stage namespace, or ``model_name`` outside partitioned PP.
+        """
+        if not self.partitioned_pp:
+            return model_name
+        return mp_stage_model_name(model_name, self.tp_size, self.pp_size, pp_rank)
+
+    def request_id_for_route(
+        self, request_id: str, pp_rank: int, dcp_rank: int | None
+    ) -> str:
+        """Return the server session id of a route.
+
+        Args:
+            request_id: External vLLM request id.
+            pp_rank: Route pipeline stage.
+            dcp_rank: Route MLA token shard, when applicable.
+
+        Returns:
+            A qualified id in partitioned PP, otherwise the external id.
+        """
+        if not self.partitioned_pp:
+            return request_id
+        return mp_route_request_id(request_id, pp_rank, dcp_rank)
+
     @property
     def kv_world_size(self) -> int:
         """Number of pieces a single token chunk's KV cache is split into
@@ -376,6 +447,8 @@ class ParallelStrategy:
             # pipeline stage and per DCP token shard.
             pp_stages = self.vllm_world_size // self.tp_size
             return pp_stages * self.dcp_size
+        if self.partitioned_pp:
+            return self.vllm_world_size
         return self.vllm_world_size // self.n_servers
 
     @property
@@ -387,6 +460,8 @@ class ParallelStrategy:
             # Row-major over (pipeline stage, token shard).
             pp_stage = self.vllm_worker_id // self.tp_size
             return pp_stage * self.dcp_size + self._get_dcp_rank()
+        if self.partitioned_pp:
+            return self.vllm_worker_id
         return self.vllm_worker_id % (self.vllm_world_size // self.n_servers)
 
     def _get_dcp_rank(self) -> int:
@@ -405,11 +480,15 @@ class ParallelStrategy:
         """
         if not self.mla_only:
             return 1
+        if self.partitioned_pp:
+            return self.local_route.num_kv_readers
         return math.ceil(self.kv_tp_size / self.dcp_size)
 
     @property
     def kv_tp_size(self) -> int:
         """Tensor-parallel size as seen from a single LMCache server."""
+        if self.partitioned_pp:
+            return self.tp_size
         return self.tp_size // self.n_servers
 
     @property
@@ -417,6 +496,8 @@ class ParallelStrategy:
         """Whether this rank is responsible for storing KV."""
         if not self.mla_only:
             return True
+        if self.partitioned_pp:
+            return self.vllm_worker_id == min(self.local_route.ranks)
         if self.dcp_size > 1:
             # One writer per token shard within every server and every
             # pipeline stage; both are contiguous rank runs, so the first
@@ -681,11 +762,48 @@ class LMCacheMPSchedulerAdapter:
             legacy_block_size,
             mq_timeout,
         )
-        assert len(server_urls) >= 1, "At least one server url required"
-        self._server_urls: list[str] = list(server_urls)
+        if not server_urls:
+            raise ValueError("At least one server url required")
+        if parallel_strategy.partitioned_pp:
+            routes = build_mp_server_routes(
+                server_urls,
+                parallel_strategy.tp_size,
+                parallel_strategy.pp_size,
+                parallel_strategy.dcp_size,
+                parallel_strategy.mla_only,
+            )
+        else:
+            routes = tuple(
+                MPServerRoute(
+                    route_id=url,
+                    server_url=url,
+                    server_index=index,
+                    pp_rank=0,
+                    dcp_rank=None,
+                    ranks=(),
+                    kv_worker_ids=(),
+                    num_kv_readers=parallel_strategy.num_kv_readers,
+                )
+                for index, url in enumerate(server_urls)
+            )
+        self._routes = {route.route_id: route for route in routes}
+        if parallel_strategy.partitioned_pp:
+            for route in routes:
+                logger.info(
+                    "LMCache MP route %s: server=%s ranks=%s kv_pieces=%s "
+                    "readers_per_piece=%d",
+                    route.route_id,
+                    route.server_url,
+                    route.ranks,
+                    route.kv_worker_ids,
+                    route.num_kv_readers,
+                )
+        self._server_urls: list[str] = list(self._routes)
         self.req_clients: dict[str, RequestClient] = {
-            url: RequestClientFactory.create(url, context=context)
-            for url in self._server_urls
+            route.route_id: RequestClientFactory.create(
+                route.server_url, context=context
+            )
+            for route in routes
         }
         self._nonblocking_lookup_status = (
             ExtraConfigDefault.nonblocking_lookup_status.default
@@ -726,7 +844,7 @@ class LMCacheMPSchedulerAdapter:
 
         # Read chunk size from lmcache
         chunk_sizes: dict[str, int] = {}
-        for url, client in self.req_clients.items():
+        for url, client in self._physical_req_clients().items():
             try:
                 chunk_sizes[url] = get_lmcache_chunk_size(
                     client, timeout=self._mq_timeout
@@ -744,6 +862,20 @@ class LMCacheMPSchedulerAdapter:
                 f"All LMCache servers must share the same chunk_size, got {chunk_sizes}"
             )
         self.lmcache_tokens_per_chunk = unique_sizes.pop()
+
+        if parallel_strategy.partitioned_pp:
+            for server_url, client in self._physical_req_clients().items():
+                if MP_PARTITIONED_PP_CAPABILITY not in get_experimental(
+                    client, timeout=self._mq_timeout
+                ):
+                    for c in self.req_clients.values():
+                        c.close()
+                    raise ValueError(
+                        f"LMCache MP server {server_url} does not advertise "
+                        f"{MP_PARTITIONED_PP_CAPABILITY}; upgrade every server "
+                        "and disable --separate-object-groups before enabling "
+                        "multi-server PP"
+                    )
 
         if self.lmcache_tokens_per_chunk % vllm_block_size != 0:
             raise ValueError(
@@ -862,17 +994,19 @@ class LMCacheMPSchedulerAdapter:
             lookup_tokens // self.lmcache_tokens_per_chunk
         ) * self.lmcache_tokens_per_chunk
 
-        key = self._create_key(
-            token_ids,
-            start=0,
-            end=aligned_end,
-            request_id=request_id,
-            cache_salt=cache_salt,
-            request_configs=request_configs,
-        ).no_worker_id_version()
-
         futures: dict[str, MessagingFuture[None]] = {
-            url: self.req_clients[url].lookup(key, self.tp_size)
+            url: self.req_clients[url].lookup(
+                self._create_key(
+                    token_ids,
+                    start=0,
+                    end=aligned_end,
+                    request_id=request_id,
+                    cache_salt=cache_salt,
+                    request_configs=request_configs,
+                    route=self._routes[url],
+                ).no_worker_id_version(),
+                self.tp_size,
+            )
             for url in self._server_urls
         }
 
@@ -920,6 +1054,7 @@ class LMCacheMPSchedulerAdapter:
                     request_id=request_id,
                     cache_salt=cs or "",
                     request_configs=request_configs,
+                    route=self._routes[url],
                 ).no_worker_id_version()
                 self.req_clients[url].free_lookup_locks(tail_key, self.tp_size)
 
@@ -994,7 +1129,13 @@ class LMCacheMPSchedulerAdapter:
             # Keep the same future until its reply arrives; never restart a poll.
             if url not in futures:
                 futures[url] = (
-                    self.req_clients[url].query_prefetch_status(request_id),
+                    self.req_clients[url].query_prefetch_status(
+                        self.parallel_strategy.request_id_for_route(
+                            request_id,
+                            self._routes[url].pp_rank,
+                            self._routes[url].dcp_rank,
+                        )
+                    ),
                     time.monotonic(),
                 )
 
@@ -1073,9 +1214,9 @@ class LMCacheMPSchedulerAdapter:
         deadline = time.monotonic() + self._mq_timeout
         futures: dict[str, MessagingFuture[Any]] = {}
         success = True
-        for url in self._server_urls:
+        for url, client in self._physical_req_clients().items():
             try:
-                futures[url] = self.req_clients[url].clear(force=False)
+                futures[url] = client.clear(force=False)
             except Exception:
                 logger.warning("Failed to submit CLEAR to %s.", url, exc_info=True)
                 success = False
@@ -1141,16 +1282,17 @@ class LMCacheMPSchedulerAdapter:
             return
 
         # Free [start, end) on every server.
-        base_key = self._create_key(
-            token_ids,
-            start=start,
-            end=end,
-            request_id=request_id,
-            cache_salt=cache_salt,
-            request_configs=request_configs,
-        ).no_worker_id_version()
         for url in self._server_urls:
-            self.req_clients[url].free_lookup_locks(base_key, self.tp_size)
+            key = self._create_key(
+                token_ids,
+                start=start,
+                end=end,
+                request_id=request_id,
+                cache_salt=cache_salt,
+                request_configs=request_configs,
+                route=self._routes[url],
+            ).no_worker_id_version()
+            self.req_clients[url].free_lookup_locks(key, self.tp_size)
 
     def end_session(self, request_id: str) -> None:
         """
@@ -1189,7 +1331,12 @@ class LMCacheMPSchedulerAdapter:
                 return
 
         for url in self._server_urls:
-            self.req_clients[url].end_session(request_id)
+            route = self._routes[url]
+            self.req_clients[url].end_session(
+                self.parallel_strategy.request_id_for_route(
+                    request_id, route.pp_rank, route.dcp_rank
+                )
+            )
 
     def report_block_allocations(
         self,
@@ -1207,10 +1354,17 @@ class LMCacheMPSchedulerAdapter:
         if not self.is_healthy or not records:
             return
 
-        for url in self._server_urls:
-            self.req_clients[url].report_block_allocation(
+        for client in self._physical_req_clients().values():
+            client.report_block_allocation(
                 os.getpid(), self.model_name, records
             )
+
+    def _physical_req_clients(self) -> dict[str, RequestClient]:
+        """Return one request client per physical server endpoint."""
+        return {
+            route.server_url: self.req_clients[route_id]
+            for route_id, route in self._routes.items()
+        }
 
     # Helper functions
     def _create_key(
@@ -1221,6 +1375,7 @@ class LMCacheMPSchedulerAdapter:
         request_id: str,
         cache_salt: str = "",
         request_configs: dict[str, Any] | None = None,
+        route: MPServerRoute | None = None,
     ) -> IPCCacheServerKey:
         """Convert token IDs to an IPC cache engine key.
 
@@ -1238,15 +1393,31 @@ class LMCacheMPSchedulerAdapter:
         """
         # NOTE: for the scheduler adapter, we don't have a worker id,
         # so we set it to None in the key.
+        pp_rank = route.pp_rank if route is not None else 0
         return IPCCacheServerKey(
-            num_kv_readers=self.parallel_strategy.num_kv_readers,
-            model_name=self.model_name,
+            num_kv_readers=(
+                route.num_kv_readers
+                if route is not None
+                else self.parallel_strategy.num_kv_readers
+            ),
+            model_name=self.parallel_strategy.model_name_for_stage(
+                self.model_name, pp_rank
+            ),
             world_size=self.world_size,
             worker_id=None,
+            selected_worker_ids=(
+                route.kv_worker_ids
+                if route is not None and self.parallel_strategy.partitioned_pp
+                else ()
+            ),
             token_ids=tuple(token_ids),
             start=start,
             end=end,
-            request_id=request_id,
+            request_id=self.parallel_strategy.request_id_for_route(
+                request_id,
+                pp_rank,
+                route.dcp_rank if route is not None else None,
+            ),
             cache_salt=cache_salt,
             request_configs=request_configs,
         )
@@ -1422,7 +1593,9 @@ class LMCacheMPWorkerAdapter:
         # Prevents re-reporting the same ID after drain clears tracking sets.
         self._returned_finished: set[str] = set()
 
-        self.model_name = model_name
+        self.model_name = parallel_strategy.model_name_for_stage(
+            model_name, parallel_strategy.pp_rank
+        )
         self.parallel_strategy = parallel_strategy
 
         # Read chunk size from lmcache
@@ -1464,6 +1637,17 @@ class LMCacheMPWorkerAdapter:
         self.experimental: set[str] = get_experimental(
             self.req_client, timeout=self._mq_timeout
         )
+        if (
+            parallel_strategy.partitioned_pp
+            and MP_PARTITIONED_PP_CAPABILITY not in self.experimental
+        ):
+            self.req_client.close()
+            raise ValueError(
+                f"LMCache MP server {server_url} does not advertise "
+                f"{MP_PARTITIONED_PP_CAPABILITY}; upgrade every server "
+                "and disable --separate-object-groups before enabling "
+                "multi-server PP"
+            )
         self.dispatcher: "Dispatcher | None" = None
 
         # Health state (shared with heartbeat thread)
@@ -1610,6 +1794,20 @@ class LMCacheMPWorkerAdapter:
             req_client=self.req_client,
             mode=self._mp_transfer_mode,
         )
+        if (
+            self.parallel_strategy.partitioned_pp
+            and isinstance(transfer_ctx, EngineDrivenTransferContext)
+            and (
+                self.parallel_strategy.is_deepseek_v4
+                or len(self.engine_group_infos) > 1
+            )
+        ):
+            transfer_ctx.close()
+            raise ValueError(
+                "Multi-server PP with DeepSeek V4 or multiple KV groups "
+                "requires LMCache-driven GPU transfer; engine-driven transfer "
+                "cannot preserve the group's compressed layout or block IDs"
+            )
         layout_hints = self._layout_hints
         self.transfer_ctx = transfer_ctx
         try:
@@ -2476,7 +2674,15 @@ class LMCacheMPWorkerAdapter:
             token_ids=tuple(token_ids),
             start=start,
             end=end,
-            request_id=request_id,
+            request_id=self.parallel_strategy.request_id_for_route(
+                request_id,
+                self.parallel_strategy.pp_rank,
+                (
+                    self.parallel_strategy.local_route.dcp_rank
+                    if self.parallel_strategy.partitioned_pp
+                    else None
+                ),
+            ),
             cache_salt=cache_salt,
             request_configs=request_configs,
         )

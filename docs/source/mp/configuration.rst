@@ -674,9 +674,11 @@ list (or comma-separated string) of server URLs via
 over the single-server ``host`` / ``port`` keys; vLLM's world size must
 be divisible by the number of servers, and each worker connects only to
 its locally-assigned server (global ranks are sliced into contiguous
-blocks, one block per server). Multi-server mode currently supports
-tensor parallelism only -- pipeline parallelism (``pp_size > 1``) and
-data parallelism (``dp_size > 1``) are rejected with a clear error.
+blocks, one block per server). Multi-server mode supports tensor parallelism
+and pipeline parallelism together. The scheduler queries only the KV pieces
+hosted on each server and requires every stage to have its required pieces
+before returning a cache hit. Data parallelism (``dp_size > 1``) remains
+unsupported with multiple servers.
 
 .. code-block:: bash
 
@@ -684,6 +686,39 @@ data parallelism (``dp_size > 1``) are rejected with a clear error.
         --tensor-parallel-size 4 \
         --kv-transfer-config \
         '{"kv_connector":"LMCacheMPConnector", "kv_role":"kv_both", "kv_connector_extra_config": {"lmcache.mp.server_urls": "tcp://host1:6667,tcp://host2:6667"}}'
+
+For a two-stage pipeline, start one LMCache server for each contiguous rank
+range and add ``--pipeline-parallel-size 2`` to the vLLM command above. A
+stage may span servers, and a server may host ranks from two stages. Each
+server must be reachable by the ranks assigned to it and must be able to
+access those ranks' GPU IPC resources. All servers must use the same chunk
+size and cache configuration, and must advertise the
+``mp_partitioned_pp_v1`` capability. The connector checks this at startup,
+gives each stage a distinct cache namespace, and gives each lookup route a
+distinct session ID.
+
+Set ``lmcache.mp.cache_namespace`` in ``kv_connector_extra_config`` when
+changing the model weights, KV backend, or pipeline layer partition without
+changing the served model name or revision; use the same value for all workers
+in the deployment. The value is folded into the internal cache identity, so
+old L2 objects cannot be mistaken for the new layout.
+
+Multi-server pipeline mode currently requires the server's default merged
+object-group setting (``--no-separate-object-groups``). Servers started with
+``--separate-object-groups`` reject worker registration for this topology:
+sliding-window and recurrent groups can have non-monotone restore boundaries,
+which require a coordinated candidate intersection and prepare step across
+servers. Hybrid models using separate object groups are therefore not yet
+supported in this mode. Models with multiple engine KV groups, including
+DeepSeek V4, use the existing LMCache-driven GPU multi-group transfer path
+with merged objects. DeepSeek V4 is stored per worker in this topology until
+its per-group TP replication semantics are verified. The non-CUDA
+engine-driven transfer path does not support multiple KV groups.
+Other MLA models also use per-worker storage by default in multi-server PP.
+Set ``lmcache.mp.replicated_mla`` to ``true`` only when the model's complete
+cached state is known to be identical across TP ranks within a DCP shard;
+the connector then stores one copy per local route and reserves one read lock
+for each local reader. DeepSeek V4 always remains per worker.
 
 Decode context parallelism (DCP)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -737,9 +772,10 @@ DCP. These combinations are rejected at startup:
      - Reason
    * - ``--prefill-context-parallel-size > 1``
      - Adds a second KV shard axis this connector does not map.
-   * - Fewer than ``dcp_size`` ranks per LMCache server
-     - No server holds a complete set of shards, and lookup takes the
-       minimum hit count across servers, so it reports no hits.
+   * - Fewer than ``dcp_size`` ranks per LMCache server without pipeline
+       parallelism
+     - The legacy TP-only placement does not map each shard to its owning
+       server. The multi-server pipeline route does map partial shard sets.
 
 An interleave value that is non-positive, larger than a resolved attention
 cache block, or does not evenly divide every resolved attention block is
@@ -786,6 +822,17 @@ from the in-process connector's ``save_decode_cache`` YAML/environment setting.
        ``lmcache.mp.port``; the vLLM world size must be divisible by the
        number of servers, and each worker connects to its
        locally-assigned server.
+   * - ``lmcache.mp.cache_namespace``
+     - ``""``
+     - Multi-server PP only: a deployment-controlled cache generation tag.
+       Change it when model weights, the KV backend, or the layer partition
+       change without a new served model name or revision, so incompatible L2
+       objects stay isolated.
+   * - ``lmcache.mp.replicated_mla``
+     - ``false``
+     - Multi-server PP only: share verified pure-MLA KV across local TP ranks
+       in each DCP shard. DeepSeek V4 remains per worker regardless of this
+       setting.
    * - ``lmcache.mp.host``
      - ``tcp://localhost``
      - Single-server deployment: request transport and host of the LMCache MP

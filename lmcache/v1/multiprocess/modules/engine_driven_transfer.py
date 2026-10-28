@@ -267,6 +267,11 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
         Raises:
             ValueError: If ``payload.dtype_str`` is not a valid torch dtype name.
         """
+        if "#mp-pp-v1-" in payload.model_name and self._ctx.separate_object_groups:
+            raise ValueError(
+                "Multi-server PP requires merged KV object groups. "
+                "Start LMCache MP without --separate-object-groups."
+            )
         shm_name = self._shm_pool_info["shm_name"]
         pool_size = self._shm_pool_info["pool_size"]
 
@@ -336,6 +341,9 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             pending_lock=self._pending_shm_lock,
             transfer_key_factory=self._make_transfer_key,
         )
+        self._ctx.layout_desc_registry.register(
+            payload.model_name, payload.world_size, layout_desc
+        )
         with self._lock:
             self._engine_driven_contexts[payload.instance_id] = entry
             self._strategies[payload.instance_id] = strategy
@@ -347,9 +355,6 @@ class EngineDrivenTransferModule(InstanceLivenessTarget):
             payload.world_size,
         )
 
-        self._ctx.layout_desc_registry.register(
-            payload.model_name, payload.world_size, layout_desc
-        )
         return RegisterEngineDrivenContextResponse(
             shm_name=shm_name, pool_size=pool_size
         )

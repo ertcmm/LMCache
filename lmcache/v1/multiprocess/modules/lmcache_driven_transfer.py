@@ -463,6 +463,13 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             engine_group_infos: Engine-neutral KV cache group metadata
                 (already msgspec-decoded by the message queue).
         """
+        if "#mp-pp-v1-" in model_name and self._ctx.separate_object_groups:
+            raise ValueError(
+                "Multi-server PP requires merged KV object groups. "
+                "Start LMCache MP without --separate-object-groups; "
+                "cross-stage sliding-window group hits need a global "
+                "candidate intersection before read locks can be acquired."
+            )
         now = time.monotonic()
         # NOOP-register: an already-registered instance (e.g. a recovering
         # worker re-registering on its first ping) refreshes its last-seen

@@ -8,7 +8,10 @@ import threading
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.mp_observability.event import Event, EventType
-from lmcache.v1.multiprocess.custom_types import BlockAllocationRecord
+from lmcache.v1.multiprocess.custom_types import (
+    MP_PARTITIONED_PP_CAPABILITY,
+    BlockAllocationRecord,
+)
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 from lmcache.v1.multiprocess.engine_module import InstanceLivenessTarget
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
@@ -149,14 +152,18 @@ class ManagementModule:
 
     @request_handler()
     def get_experimental(self) -> list[str]:
-        """Return the experimental intermediate tensor transfer built in the
-        server.
+        """Return protocol capabilities and experimental tensor transfers.
 
         Returns:
-            The enabled experimental intermediate tensor transfer types.
-            See ``lmcache.v1.multiprocess.modules.experimental.__init__``.
+            Capability names followed by enabled intermediate tensor transfer
+            types. See ``lmcache.v1.multiprocess.modules.experimental.__init__``.
         """
-        return list(self._experimental_transfer)
+        capabilities = (
+            [MP_PARTITIONED_PP_CAPABILITY]
+            if not self._ctx.separate_object_groups
+            else []
+        )
+        return [*capabilities, *self._experimental_transfer]
 
     @request_handler(HandlerType.BLOCKING)
     def clear(self, force: bool = False) -> None:

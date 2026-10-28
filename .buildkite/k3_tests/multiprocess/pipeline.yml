@@ -212,6 +212,20 @@ steps:
         plugins: [{ kubernetes: { podSpec: *pod-2gpu } }]
         artifact_paths: ["*.log"]
 
+      # Multi-server pipeline parallelism: PP0 and PP1 have separate LMCache
+      # server endpoints. The workload verifies that both servers independently
+      # store and serve the same request's stage-local KV after APC reset.
+      - label: ":compression: vLLM / multi_server_pp / zmq"
+        command: .buildkite/k3_tests/multiprocess/run.sh multi_server_pp
+        env:
+          INFERENCE_ENGINE: "vllm"
+          LMCACHE_REQUEST_TRANSPORT: "zmq"
+        timeout_in_minutes: 45
+        retry: *flaky-retry
+        agents: { queue: "k8s" }
+        plugins: [{ kubernetes: { podSpec: *pod-2gpu } }]
+        artifact_paths: ["*.log"]
+
       # Two LMCache MP instances + two vLLM instances + one coordinator on a
       # single 2-GPU pod (localhost). Verifies engine B serves a long prompt's
       # KV from engine A over P2P.

@@ -20,6 +20,12 @@ response extensions, endpoints, logs, or model launch flags. A future
 `mp-autostart-tp2.sh` verifies vLLM-specific connector auto-start behavior and
 therefore remains under `vllm/` rather than `common/`.
 
+`vllm/multi-server-pp.sh` starts two LMCache MP servers and a TP=1, PP=2 vLLM
+engine. It compares a cold completion with one after clearing vLLM's local
+prefix cache and requires both stage-local servers to report a retrieval.
+This complements the existing TP=2 autostart and Kimi/DSv4 TP correctness
+workloads by exercising the multi-server PP routing path.
+
 The harness converts a test name from underscores to hyphens and discovers the
 script automatically. For example, `long_doc_qa` resolves to
 `common/long-doc-qa.sh`, while `cache_stats` with `INFERENCE_ENGINE=vllm`

@@ -101,6 +101,16 @@ class LayoutDescRegistry:
                 )
                 return
 
+            if "#mp-pp-v1-" in model_name and (
+                entry.layout_desc != layout_desc
+                or entry.attn_desc != attn_desc
+                or entry.group_layout_descs != group_layout_descs
+            ):
+                raise ValueError(
+                    "Workers of one multi-server PP stage registered "
+                    "different KV layouts or object-group windows for "
+                    f"{model_name!r}; refusing to overwrite the lookup layout"
+                )
             entry.layout_desc = layout_desc
             entry.attn_desc = attn_desc
             entry.group_layout_descs = group_layout_descs

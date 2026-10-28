@@ -5,13 +5,12 @@
 from google.protobuf.internal import containers as _containers
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
-from collections.abc import Iterable as _Iterable
-from typing import ClassVar as _ClassVar, Optional as _Optional
+from typing import ClassVar as _ClassVar, Iterable as _Iterable, Optional as _Optional
 
 DESCRIPTOR: _descriptor.FileDescriptor
 
 class IpcCacheServerKey(_message.Message):
-    __slots__ = ("model_name", "world_size", "worker_id", "token_ids", "start", "end", "request_id", "cache_salt", "encoded_request_configs", "num_kv_readers")
+    __slots__ = ("model_name", "world_size", "worker_id", "token_ids", "start", "end", "request_id", "cache_salt", "encoded_request_configs", "num_kv_readers", "selected_worker_ids")
     MODEL_NAME_FIELD_NUMBER: _ClassVar[int]
     WORLD_SIZE_FIELD_NUMBER: _ClassVar[int]
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
@@ -22,6 +21,7 @@ class IpcCacheServerKey(_message.Message):
     CACHE_SALT_FIELD_NUMBER: _ClassVar[int]
     ENCODED_REQUEST_CONFIGS_FIELD_NUMBER: _ClassVar[int]
     NUM_KV_READERS_FIELD_NUMBER: _ClassVar[int]
+    SELECTED_WORKER_IDS_FIELD_NUMBER: _ClassVar[int]
     model_name: str
     world_size: int
     worker_id: int
@@ -32,7 +32,8 @@ class IpcCacheServerKey(_message.Message):
     cache_salt: str
     encoded_request_configs: bytes
     num_kv_readers: int
-    def __init__(self, model_name: _Optional[str] = ..., world_size: _Optional[int] = ..., worker_id: _Optional[int] = ..., token_ids: _Optional[_Iterable[int]] = ..., start: _Optional[int] = ..., end: _Optional[int] = ..., request_id: _Optional[str] = ..., cache_salt: _Optional[str] = ..., encoded_request_configs: _Optional[bytes] = ..., num_kv_readers: _Optional[int] = ...) -> None: ...
+    selected_worker_ids: _containers.RepeatedScalarFieldContainer[int]
+    def __init__(self, model_name: _Optional[str] = ..., world_size: _Optional[int] = ..., worker_id: _Optional[int] = ..., token_ids: _Optional[_Iterable[int]] = ..., start: _Optional[int] = ..., end: _Optional[int] = ..., request_id: _Optional[str] = ..., cache_salt: _Optional[str] = ..., encoded_request_configs: _Optional[bytes] = ..., num_kv_readers: _Optional[int] = ..., selected_worker_ids: _Optional[_Iterable[int]] = ...) -> None: ...
 
 class EventIpcHandleResult(_message.Message):
     __slots__ = ("event_ipc_handle", "success")

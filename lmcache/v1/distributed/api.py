@@ -43,13 +43,13 @@ _VALID_FETCHING_POLICIES = frozenset(get_args(FetchingPolicy))
 def _lookup_kv_ranks(ipc_key: "IPCCacheServerKey") -> list[int]:
     """The kv ranks an IPC key addresses, in rank order.
 
-    A key without a ``worker_id`` (a lookup) fans out to every worker of its
-    world size; a worker-specific key addresses that worker's shard only.
+    A key without a ``worker_id`` (a lookup) fans out to its selected pieces,
+    or to every worker in the legacy all-ranks form. A worker-specific key
+    addresses that worker's shard only.
     """
     if ipc_key.worker_id is None:
-        # For look up request, we want to expand to all workers
-        # TODO (ApostaC): include local world size/rank info
-        # in the future once it's in IPCCacheServerKey
+        # The scheduler selects only pieces hosted by this server/PP route.
+        selected_ids = ipc_key.selected_worker_ids or tuple(range(ipc_key.world_size))
         return [
             ObjectKey.ComputeKVRank(
                 world_size=ipc_key.world_size,
@@ -57,7 +57,7 @@ def _lookup_kv_ranks(ipc_key: "IPCCacheServerKey") -> list[int]:
                 local_world_size=ipc_key.world_size,
                 local_rank=worker_id,
             )
-            for worker_id in range(ipc_key.world_size)
+            for worker_id in selected_ids
         ]
     return [
         ObjectKey.ComputeKVRank(

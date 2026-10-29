@@ -697,6 +697,12 @@ size and cache configuration, and must advertise the
 gives each stage a distinct cache namespace, and gives each lookup route a
 distinct session ID.
 
+Multi-server PP requires ``prefill_context_parallel_size == 1`` and
+``world_size == tensor_parallel_size * pipeline_parallel_size``. PCP adds a
+rank axis that the route mapping does not implement; it is rejected even
+when DCP is disabled. See :doc:`multi_server_pp` for deployment constraints
+and the regression workload.
+
 Set ``lmcache.mp.cache_namespace`` in ``kv_connector_extra_config`` when
 changing the model weights, KV backend, or pipeline layer partition without
 changing the served model name or revision; use the same value for all workers

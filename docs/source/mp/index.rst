@@ -5,6 +5,7 @@ Overview
    :hidden:
 
    request_transport
+   multi_server_pp
    multi_l1
 
 LMCache multiprocess (MP) mode runs LMCache as a **standalone service** that

@@ -674,9 +674,24 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "start multiple servers separately and disable lmcache.mp.autostart."
             )
 
+        pc = vllm_config.parallel_config
+        if n_servers > 1 and pc.pipeline_parallel_size > 1:
+            pcp_size = getattr(pc, "prefill_context_parallel_size", 1)
+            if pcp_size != 1:
+                raise ValueError(
+                    "Multi-server PP does not support prefill-context "
+                    f"parallelism; got prefill_context_parallel_size={pcp_size}. "
+                    "Set --prefill-context-parallel-size 1."
+                )
+            expected_world_size = pc.tensor_parallel_size * pc.pipeline_parallel_size
+            if pc.world_size != expected_world_size:
+                raise ValueError(
+                    "Multi-server PP requires world_size == TP * PP; "
+                    f"got world_size={pc.world_size}, expected {expected_world_size}."
+                )
+
         validate_dcp_support(vllm_config, n_servers, kv_cache_config)
 
-        pc = vllm_config.parallel_config
         if pc.world_size % n_servers:
             raise ValueError(
                 f"world_size ({pc.world_size}) must be divisible by "

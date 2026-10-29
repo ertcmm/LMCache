@@ -135,3 +135,51 @@ def test_connector_single_server_autostart_keeps_resolved_endpoint(
         ]
     else:
         assert module.LMCacheMPWorkerAdapter.call_args.kwargs["server_url"] == expected
+
+
+@pytest.mark.parametrize("role_name", ["SCHEDULER", "WORKER"])
+@pytest.mark.parametrize(
+    "pcp_size,dcp_size,world_size,message",
+    [
+        (2, 1, 8, "prefill-context"),
+        (2, 2, 8, "prefill-context"),
+        (1, 1, 6, "world_size == TP"),
+    ],
+)
+def test_partitioned_pp_rejects_extra_rank_axes_before_network(
+    connector_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    role_name: str,
+    pcp_size: int,
+    dcp_size: int,
+    world_size: int,
+    message: str,
+) -> None:
+    """PCP and inconsistent world sizes never reach either network adapter."""
+    module = connector_module
+    role = getattr(module.KVConnectorRole, role_name)
+    monkeypatch.setattr(
+        module.LMCacheMPConnector, "role", PropertyMock(return_value=role)
+    )
+    extra = {"lmcache.mp.server_urls": ["localhost:5555", "localhost:5556"]}
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_cache_mode="none"),
+        kv_transfer_config=SimpleNamespace(
+            kv_connector_extra_config=extra,
+            get_from_extra_config=extra.get,
+            is_kv_producer=True,
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=2,
+            pipeline_parallel_size=2,
+            prefill_context_parallel_size=pcp_size,
+            decode_context_parallel_size=dcp_size,
+            world_size=world_size,
+            data_parallel_size=1,
+        ),
+    )
+    with pytest.raises(ValueError, match=message):
+        module.LMCacheMPConnector(config, role)
+    module.validate_dcp_support.assert_not_called()
+    module.LMCacheMPSchedulerAdapter.assert_not_called()
+    module.LMCacheMPWorkerAdapter.assert_not_called()

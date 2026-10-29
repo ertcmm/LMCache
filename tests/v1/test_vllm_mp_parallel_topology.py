@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Rank routing tests for multi-server vLLM TP/PP topologies."""
 
+# Future
 from __future__ import annotations
 
+# Third Party
 import pytest
 
+# First Party
 from lmcache.integration.vllm.mp_parallel_topology import (
     build_mp_server_routes,
     mp_route_request_id,
@@ -191,3 +194,15 @@ def test_pp_stage_cache_names_and_request_ids_are_isolated() -> None:
     assert mp_route_request_id("a:p1", 0, None) != mp_route_request_id(
         "a", 1, None
     )
+
+
+@pytest.mark.parametrize(
+    "world_size,worker_id,message",
+    [(8, 0, "world_size == TP"), (4, -1, "rank"), (4, 4, "rank")],
+)
+def test_partitioned_strategy_rejects_unmapped_workers(
+    world_size: int, worker_id: int, message: str
+) -> None:
+    """Adapters cannot construct PP strategies with extra axes or invalid ranks."""
+    with pytest.raises(ValueError, match=message):
+        ParallelStrategy(False, world_size, worker_id, 2, 2, 2)

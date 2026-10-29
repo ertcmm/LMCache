@@ -26,6 +26,19 @@ prefix cache and requires both stage-local servers to report a retrieval.
 This complements the existing TP=2 autostart and Kimi/DSv4 TP correctness
 workloads by exercising the multi-server PP routing path.
 
+The workload also checks asymmetric L1 hits and tail-lock release (with no
+L2 configured), a streaming client disconnect followed by session cleanup,
+and one-server restart/re-registration followed by a fresh cache hit. These
+checks run by default; set `PP_EXTENDED_CHECKS=0` for the original smoke test.
+When L2 is configured, the asymmetric L1-only case explicitly skips because
+the emptied stage would reload from L2. Set `VERIFY_L2_RETRIEVAL=1` and supply
+`LMCACHE_L2_ADAPTER_JSON_A/B` to require L2 hits on both stages. The helper
+`vllm/multi_server_pp_checks.py` uses only the Python standard library.
+
+Run through `multiprocess/run.sh multi_server_pp` or
+`scripts/run-single-test.sh multi_server_pp` so the harness cleans up all
+recorded server and vLLM PIDs, including the replacement server after restart.
+
 The harness converts a test name from underscores to hyphens and discovers the
 script automatically. For example, `long_doc_qa` resolves to
 `common/long-doc-qa.sh`, while `cache_stats` with `INFERENCE_ENGINE=vllm`

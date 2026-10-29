@@ -4,7 +4,7 @@ stubbed (see ``fake_adapter``); no GPU or live server needed. End-to-end
 recovery: multiprocess ``workloads/common/restart-recovery.sh``."""
 
 # Standard
-from typing import Callable, ClassVar, cast
+from typing import Callable, ClassVar
 from unittest.mock import MagicMock
 import gc
 import os
@@ -13,6 +13,7 @@ import time
 import weakref
 
 # Third Party
+from opentelemetry import metrics
 import pytest
 import torch
 
@@ -25,6 +26,15 @@ from lmcache.integration.vllm.vllm_multi_process_adapter import (
     LMCacheMPWorkerAdapter,
     LoadStoreOp,
     ParallelStrategy,
+)
+from lmcache.v1.mp_observability.event import Event, EventType
+from lmcache.v1.mp_observability.event_bus import EventCallback
+from lmcache.v1.mp_observability.subscribers.metrics.l0_lifecycle import (
+    L0LifecycleSubscriber,
+)
+from lmcache.v1.multiprocess.custom_types import (
+    MP_PARTITIONED_PP_CAPABILITY,
+    BlockAllocationRecord,
 )
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo
 from lmcache.v1.multiprocess.transport.base import RequestClient
@@ -167,21 +177,44 @@ def _make_worker_adapter(
 
 
 def _make_scheduler_adapter(
+    monkeypatch: pytest.MonkeyPatch,
     servers: list[str],
+    parallel_strategy: ParallelStrategy | None = None,
 ) -> tuple[LMCacheMPSchedulerAdapter, dict[str, MagicMock]]:
-    """Build scheduler reset state around transport-neutral client mocks."""
+    """Construct the scheduler using its real initializer and stubbed RPCs."""
     clients: dict[str, MagicMock] = {
         server: MagicMock(name=f"req_client[{server}]", spec=RequestClient)
         for server in servers
     }
-    adapter = LMCacheMPSchedulerAdapter.__new__(LMCacheMPSchedulerAdapter)
-    adapter._server_urls = servers
-    adapter.req_clients = cast(dict[str, RequestClient], clients)
-    adapter._mq_timeout = 5.0
-    adapter._health_events = {}
-    for server in servers:
-        adapter._health_events[server] = threading.Event()
-        adapter._health_events[server].set()
+    monkeypatch.setattr(
+        adapter_mod.RequestClientFactory,
+        "create",
+        lambda server_url, **kwargs: clients[server_url],
+    )
+    monkeypatch.setattr(adapter_mod, "get_lmcache_chunk_size", lambda *a, **kw: 256)
+    monkeypatch.setattr(
+        adapter_mod, "get_experimental", lambda *a, **kw: {MP_PARTITIONED_PP_CAPABILITY}
+    )
+    FakeHeartbeatThread.instances.clear()
+    FakeHeartbeatThread.start_hook = None
+    monkeypatch.setattr(adapter_mod, "HeartbeatThread", FakeHeartbeatThread)
+    if parallel_strategy is None:
+        parallel_strategy = ParallelStrategy(
+            mla_only=False,
+            vllm_world_size=len(servers),
+            vllm_worker_id=0,
+            tp_size=len(servers),
+            pp_size=1,
+            n_servers=len(servers),
+        )
+    adapter = LMCacheMPSchedulerAdapter(
+        server_urls=servers,
+        context=MagicMock(),
+        model_name="test-model",
+        vllm_block_size=16,
+        parallel_strategy=parallel_strategy,
+        mq_timeout=5.0,
+    )
     return adapter, clients
 
 
@@ -278,7 +311,7 @@ def test_scheduler_reset_cache_clears_every_server_without_force(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Reset sends non-forced CLEAR and preserves local lookup state."""
-    adapter, clients = _make_scheduler_adapter(["server-a", "server-b"])
+    adapter, clients = _make_scheduler_adapter(monkeypatch, ["server-a", "server-b"])
     lookup_state = {
         "_pending_lookups": {"req-1"},
         "_unacked_lookups": {"req-1": MagicMock()},
@@ -312,10 +345,11 @@ def test_scheduler_reset_cache_clears_every_server_without_force(
     [TimeoutError("server down"), RuntimeError("rpc failed")],
 )
 def test_scheduler_reset_cache_failure_preserves_server_health(
+    monkeypatch: pytest.MonkeyPatch,
     error: Exception,
 ) -> None:
     """A best-effort CLEAR failure does not disable cache data operations."""
-    adapter, clients = _make_scheduler_adapter(["server-a"])
+    adapter, clients = _make_scheduler_adapter(monkeypatch, ["server-a"])
     future = MagicMock(name="clear_future")
     future.result.side_effect = error
     clients["server-a"].clear.return_value = future
@@ -339,6 +373,169 @@ def test_connector_reset_cache_forwards_with_active_requests() -> None:
     assert connector.reset_cache() is True
     connector.scheduler_adapter.reset_cache.assert_called_once_with()
     assert connector.request_trackers == {"req-1": tracker}
+
+
+@pytest.mark.parametrize("mla_only", [False, True])
+def test_pp_clear_and_allocation_report_once_per_physical_server(
+    monkeypatch: pytest.MonkeyPatch, mla_only: bool
+) -> None:
+    """Multi-stage/DCP routes share CLEAR and one matching telemetry owner."""
+    adapter, clients = _make_scheduler_adapter(
+        monkeypatch,
+        ["server-a", "server-b"],
+        ParallelStrategy(mla_only, 12, 0, 4, 3, 2, dcp_size=2),
+    )
+    original = BlockAllocationRecord("request:p0:d1", [7], [1, 2, 3, 4])
+    adapter.report_block_allocations([original])
+    adapter.end_session(original.req_id)
+    assert adapter.reset_cache() is True
+
+    for client in clients.values():
+        client.clear.assert_called_once_with(force=False)
+        client.report_block_allocation.assert_called_once()
+        records = client.report_block_allocation.call_args.args[2]
+        assert records[0].new_block_ids == original.new_block_ids
+        assert records[0].new_token_ids == original.new_token_ids
+        end_ids = [call.args[0] for call in client.end_session.call_args_list]
+        assert records[0].req_id in end_ids
+        assert len(end_ids) == (4 if mla_only else 2)
+    assert original.req_id == "request:p0:d1"
+    adapter.shutdown()
+
+
+def test_pp_allocation_completion_releases_l0_metric_owners(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Completed PP requests become block reuses in the actual L0 subscriber."""
+    histograms: dict[str, MagicMock] = {}
+    meter = MagicMock()
+    meter.create_histogram.side_effect = lambda name, **kwargs: histograms.setdefault(
+        name, MagicMock()
+    )
+    monkeypatch.setattr(metrics, "get_meter", lambda *a, **kw: meter)
+    adapter, clients = _make_scheduler_adapter(
+        monkeypatch,
+        ["server-a", "server-b"],
+        ParallelStrategy(True, 12, 0, 4, 3, 2, dcp_size=2),
+    )
+    for client in clients.values():
+        callbacks = L0LifecycleSubscriber(sample_rate=1.0).get_subscriptions()
+        allocation = callbacks[EventType.MP_VLLM_BLOCK_ALLOCATION]
+        end = callbacks[EventType.MP_VLLM_END_SESSION]
+
+        def report(
+            instance_id: int,
+            model_name: str,
+            records: list[BlockAllocationRecord],
+            callback: EventCallback = allocation,
+        ) -> None:
+            callback(
+                Event(
+                    event_type=EventType.MP_VLLM_BLOCK_ALLOCATION,
+                    metadata={
+                        "instance_id": instance_id,
+                        "model_name": model_name,
+                        "records": records,
+                    },
+                )
+            )
+
+        client.report_block_allocation.side_effect = report
+        client.end_session.side_effect = lambda req_id, callback=end: callback(
+            Event(
+                event_type=EventType.MP_VLLM_END_SESSION,
+                metadata={"request_id": req_id},
+            )
+        )
+
+    for i in range(1000):
+        request_id = f"request-{i}"
+        adapter.report_block_allocations(
+            [BlockAllocationRecord(request_id, [7], [1, 2, 3, 4])]
+        )
+        adapter.end_session(request_id)
+    # Eviction exports the bounded reuse history accumulated by the subscriber.
+    adapter.report_block_allocations([BlockAllocationRecord("evict", [7], [5])])
+    assert histograms["lmcache_mp.l0_block_reuse_gap"].record.call_count == 6
+    adapter.end_session("evict")
+    adapter.shutdown()
+
+
+def test_pp_lookup_mismatch_frees_only_the_longer_routes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shorter PP hit frees each longer route's tail using its own key."""
+    adapter, clients = _make_scheduler_adapter(
+        monkeypatch,
+        ["server-a", "server-b"],
+        ParallelStrategy(False, 12, 0, 4, 3, 2),
+    )
+    for index, client in enumerate(clients.values()):
+        client.lookup.return_value.query.return_value = True
+        client.query_prefetch_status.return_value.query.return_value = True
+        client.query_prefetch_status.return_value.result.return_value = index + 1
+    adapter.maybe_submit_lookup_request("req", list(range(1024)))
+    assert adapter.check_lookup_result("req") == 256
+    clients["server-a"].free_lookup_locks.assert_not_called()
+    longer = clients["server-b"]
+    assert longer.free_lookup_locks.call_count == 2
+    lookup_keys = {
+        call.args[0].request_id: call.args[0]
+        for call in longer.lookup.call_args_list
+    }
+    for call in longer.free_lookup_locks.call_args_list:
+        tail_key = call.args[0]
+        lookup_key = lookup_keys[tail_key.request_id]
+        assert (tail_key.start, tail_key.end) == (256, 512)
+        assert tail_key.model_name == lookup_key.model_name
+        assert tail_key.selected_worker_ids == lookup_key.selected_worker_ids
+        assert tail_key.num_kv_readers == lookup_key.num_kv_readers
+    adapter.end_session("req")
+    adapter.cleanup_lookup_result("req")
+    assert adapter.check_lookup_result("req") == 0
+    adapter.shutdown()
+
+
+def test_pp_cancel_before_lookup_ack_ends_every_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation drains pending LOOKUP acknowledgements before route cleanup."""
+    adapter, clients = _make_scheduler_adapter(
+        monkeypatch,
+        ["server-a", "server-b"],
+        ParallelStrategy(False, 2, 0, 1, 2, 2),
+    )
+    adapter.maybe_submit_lookup_request("cancelled", list(range(512)))
+    adapter.end_session("cancelled")
+    for client in clients.values():
+        client.lookup.return_value.result.assert_called_once()
+        lookup_key = client.lookup.call_args.args[0]
+        client.end_session.assert_called_once_with(lookup_key.request_id)
+    adapter.cleanup_lookup_result("cancelled")
+    assert adapter.check_lookup_result("cancelled") == 0
+    adapter.shutdown()
+
+
+def test_pp_rejects_server_without_partitioned_lookup_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An old or separate-object-group server cannot silently ignore selection."""
+    clients = [MagicMock(spec=RequestClient), MagicMock(spec=RequestClient)]
+    factory = MagicMock()
+    factory.create.side_effect = clients
+    monkeypatch.setattr(adapter_mod, "RequestClientFactory", factory)
+    monkeypatch.setattr(adapter_mod, "get_lmcache_chunk_size", lambda *a, **kw: 256)
+    monkeypatch.setattr(adapter_mod, "get_experimental", lambda *a, **kw: set())
+    with pytest.raises(ValueError, match=MP_PARTITIONED_PP_CAPABILITY):
+        LMCacheMPSchedulerAdapter(
+            server_urls=["server-a", "server-b"],
+            context=MagicMock(),
+            model_name="test-model",
+            vllm_block_size=16,
+            parallel_strategy=ParallelStrategy(False, 2, 0, 1, 2, 2),
+        )
+    for client in clients:
+        client.close.assert_called_once()
 
 
 def test_connector_reset_cache_is_noop_on_worker() -> None:

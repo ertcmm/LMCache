@@ -593,6 +593,33 @@ def test_generated_grpc_services_communicate_end_to_end(
     ]
 
 
+def test_grpc_preserves_partitioned_pp_lookup_selection(
+    grpc_client: tuple[GrpcMultiprocessClient, _Calls],
+) -> None:
+    """Selected shards and reader counts survive a real gRPC round trip."""
+    client, calls = grpc_client
+    key = IPCCacheServerKey(
+        model_name="model#mp-pp-v1-t4-p2-stage1",
+        world_size=8,
+        worker_id=None,
+        token_ids=(1, 2, 3),
+        start=0,
+        end=3,
+        request_id="mp-pp-v1:3:req:p1:d0",
+        num_kv_readers=2,
+        selected_worker_ids=(4, 6),
+    )
+    client.lookup(key, 4).result(timeout=5)
+    assert calls.lookup is not None
+    received, tp_size = calls.lookup
+    # These fields deliberately do not participate in dataclass equality.
+    assert received.selected_worker_ids == (4, 6)
+    assert received.num_kv_readers == 2
+    assert received.request_id == key.request_id
+    assert received.worker_id is None
+    assert tp_size == 4
+
+
 def test_generated_grpc_server_module_call_round_trips(
     grpc_client: tuple[GrpcMultiprocessClient, _Calls],
 ) -> None:

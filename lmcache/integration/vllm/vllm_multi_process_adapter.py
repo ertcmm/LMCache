@@ -383,6 +383,14 @@ class ParallelStrategy:
     is_deepseek_v4: bool = False
     """The model uses DeepSeek V4 KV layouts, including compressed states."""
 
+    def __post_init__(self) -> None:
+        """Reject PP rank geometries that the route mapper cannot represent."""
+        if self.partitioned_pp:
+            if self.vllm_world_size != self.tp_size * self.pp_size:
+                raise ValueError("Multi-server PP requires world_size == TP * PP")
+            if not 0 <= self.vllm_worker_id < self.vllm_world_size:
+                raise ValueError("Worker rank is outside the TP * PP world")
+
     @property
     def partitioned_pp(self) -> bool:
         """Whether a pipeline is placed across multiple MP servers."""
@@ -1347,6 +1355,11 @@ class LMCacheMPSchedulerAdapter:
         Fire-and-forget: does not wait for a response. If the server
         is unhealthy the report is silently dropped.
 
+        Allocation telemetry is scheduler-wide, so send it once per physical
+        server. In partitioned PP use that server's representative route ID
+        for its request owner, matching one of the END_SESSION notifications.
+        The original records are not mutated.
+
         Args:
             records: List of BlockAllocationRecord with per-request
                 block and token allocation deltas.
@@ -1354,17 +1367,20 @@ class LMCacheMPSchedulerAdapter:
         if not self.is_healthy or not records:
             return
 
-        for client in self._physical_req_clients().values():
-            client.report_block_allocation(
-                os.getpid(), self.model_name, records
+        for route in self._physical_routes().values():
+            route_records = [
+                BlockAllocationRecord(
+                    req_id=self.parallel_strategy.request_id_for_route(
+                        record.req_id, route.pp_rank, route.dcp_rank
+                    ),
+                    new_block_ids=record.new_block_ids,
+                    new_token_ids=record.new_token_ids,
+                )
+                for record in records
+            ]
+            self.req_clients[route.route_id].report_block_allocation(
+                os.getpid(), self.model_name, route_records
             )
-
-    def _physical_req_clients(self) -> dict[str, RequestClient]:
-        """Return one request client per physical server endpoint."""
-        return {
-            route.server_url: self.req_clients[route_id]
-            for route_id, route in self._routes.items()
-        }
 
     # Helper functions
     def _create_key(
@@ -1449,6 +1465,17 @@ class LMCacheMPSchedulerAdapter:
             self._mq_timeout,
         )
         self._health_events[url].clear()
+
+    def _physical_routes(self) -> dict[str, MPServerRoute]:
+        """Select one stable representative route per server endpoint."""
+        return {route.server_url: route for route in self._routes.values()}
+
+    def _physical_req_clients(self) -> dict[str, RequestClient]:
+        """Return one request client per physical server endpoint."""
+        return {
+            server_url: self.req_clients[route.route_id]
+            for server_url, route in self._physical_routes().items()
+        }
 
 
 class LMCacheMPWorkerAdapter:

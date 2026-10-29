@@ -220,6 +220,7 @@ steps:
         env:
           INFERENCE_ENGINE: "vllm"
           LMCACHE_REQUEST_TRANSPORT: "zmq"
+          PP_EXTENDED_CHECKS: "1"
         timeout_in_minutes: 45
         retry: *flaky-retry
         agents: { queue: "k8s" }
